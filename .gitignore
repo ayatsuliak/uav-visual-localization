@@ -1,0 +1,117 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Testing / coverage / type checking
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =============================================================================
+# IDEs and editors
+# =============================================================================
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.spyproject/
+
+# =============================================================================
+# Operating systems
+# =============================================================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# =============================================================================
+# Secrets and local settings
+# =============================================================================
+.env
+.env.*
+*.local
+
+# =============================================================================
+# Model weights / caches (downloaded automatically by LightGlue / Kornia)
+# =============================================================================
+*.pth
+*.pt
+*.ckpt
+*.onnx
+weights/
+checkpoints/
+
+# =============================================================================
+# Data
+# Raw inputs are large and may be subject to third-party licences:
+# they are kept locally only. Processed images are fully reproducible
+# with scripts/prepare_map.py and scripts/prepare_frames.py.
+# =============================================================================
+data/raw/maps/*
+!data/raw/maps/.gitkeep
+data/raw/video/*
+!data/raw/video/.gitkeep
+
+data/processed/*
+!data/processed/frames/
+!data/processed/tiles/
+data/processed/frames/*
+!data/processed/frames/.gitkeep
+data/processed/tiles/*
+!data/processed/tiles/.gitkeep
+
+# Per-run logs with timestamps and file hashes (regenerated on every run)
+data/metadata/*_info.json
+
+# Temporary files written during atomic CSV saves
+*.tmp
+
+# =============================================================================
+# Experiment outputs (regenerable; commit selected figures deliberately
+# with `git add -f <file>` when they are needed for the thesis)
+# =============================================================================
+experiments/results/**/*
+!experiments/results/**/
+!experiments/results/**/.gitkeep
+experiments/figures/**/*
+!experiments/figures/**/
+!experiments/figures/**/.gitkeep
+
+# Large media anywhere else in the repository
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.mkv
+*.npz
+*.npy

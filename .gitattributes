@@ -1,0 +1,16 @@
+# Normalise line endings: LF in the repository, native on checkout.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.mp4 binary
+*.pdf binary
+*.docx binary
+*.zip binary

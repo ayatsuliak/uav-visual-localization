@@ -1,0 +1,9 @@
+opencv-python
+numpy
+matplotlib
+pandas
+torch
+torchvision
+kornia
+git+https://github.com/cvg/LightGlue.git
+pytest
