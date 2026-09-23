@@ -20,8 +20,8 @@ Out of scope: training new networks, re-implementing LightGlue/LoFTR, full SLAM,
 | Stage | Description | Status |
 |---|---|---|
 | 1 | Data preparation: map tiling, frame extraction, metadata, integrity checks | ✅ done |
-| 2 | Unified pipeline `frame + tile → matcher → RANSAC → metrics` | ⏳ next |
-| 3 | Automatic best-tile search and ranking | 🧪 prototype (`localize_frame.py`) |
+| 2 | Unified pipeline `frame + tile → matcher → RANSAC → metrics` | ✅ done |
+| 3 | Automatic best-tile search and ranking | ⏳ next (prototype: `localize_frame.py`) |
 | 4 | Frame position on the full map | 🧪 prototype |
 | 5–6 | Frame sequences, temporal consistency, neighbour-tile search | planned |
 | 7–10 | Experiments, ground truth, error statistics, figures | planned |
@@ -46,8 +46,8 @@ uav-visual-localization/
 ├── src/
 │   ├── config.py          # paths and default parameters
 │   ├── preprocessing/     # images.py, tiles.py, frames.py, validation.py
-│   ├── matching/          # base.py (ImageMatcher), lightglue.py, loftr.py
-│   ├── geometry/          # homography.py (RANSAC, reprojection error)
+│   ├── matching/          # base.py (ImageMatcher), lightglue.py, loftr.py, pipeline.py
+│   ├── geometry/          # homography.py (RANSAC, reprojection error, plausibility)
 │   ├── evaluation/        # metrics.py, scoring.py
 │   ├── localization/      # estimate.py (tile → map coordinates)
 │   └── visualization/     # matches.py
@@ -72,8 +72,9 @@ python -m venv .venv
 # Windows (PowerShell):  .venv\Scripts\Activate.ps1
 # Linux / macOS:         source .venv/bin/activate
 
-# For GPU, install a CUDA build of PyTorch first, e.g. CUDA 12.4:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# For GPU, install a CUDA build of PyTorch first (the cu124 index stops at torch 2.6).
+# Used for the thesis: torch 2.14.0 + CUDA 12.6 on a GTX 1650 (sm_75):
+pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu126
 
 pip install -r requirements.txt
 ```
@@ -94,7 +95,8 @@ All map coordinates are **pixel** coordinates. The map has no georeference or kn
 Observed properties relevant to the method (from the reference pair):
 
 - the video was recorded in a different season than the map (leafless winter vs. summer imagery);
-- one frame pixel corresponds to roughly 0.25 map pixels, so a full 1920 × 1080 frame covers about 480 × 270 map pixels (rough manual estimate, to be calibrated in Stage 2).
+- one frame pixel corresponds to ≈0.27 map pixels (calibrated in Stage 2, see below), so a full 1920 × 1080 frame covers about **518 × 292 map pixels**, which is wider than a 512 px tile;
+- the scene is not planar: tall buildings cause parallax between roofs and the ground.
 
 ## Conventions (mandatory for all modules)
 
@@ -163,44 +165,106 @@ The check verifies:
 - **pixel identity of every tile with the map crop at `(x_origin, y_origin)`**;
 - frame sequences: strictly increasing indices with a constant step, `timestamp = idx / fps`, and frame size.
 
-### Tests
+## Stage 2: unified matching pipeline
+
+```bash
+python scripts/evaluate.py                        # LightGlue and LoFTR on data/metadata/eval_pairs.csv
+python scripts/evaluate.py --repeats 5            # median time over 5 runs
+python scripts/evaluate.py --methods LoFTR --work-scale 1.5 --ransac-method USAC_MAGSAC \
+    --output experiments/results/raw/loftr_ws15_magsac.csv
+python scripts/summarize.py                       # aggregates into experiments/results/summary/
+```
+
+Both methods run through the same `PairMatchingPipeline` (`src/matching/pipeline.py`), with the same preprocessing, geometric verification and success criterion:
+
+```
+frame (1920×1080) ──resize × s_f·k──┐
+                                    ├─ extract / match_features ─ points → original px ─ RANSAC ─ plausibility ─ metrics
+tile  (512×512)   ──resize × k──────┘
+```
+
+- **Scale normalization.** `s_f = FRAME_TO_MAP_SCALE = 0.27` map pixels per frame pixel; `k = WORK_SCALE = 1.0`. Frame and tile are brought to the same resolution, and the whole frame is used (no centre crop).
+- **One coordinate system.** Matchers work at working resolution, but the pipeline maps all correspondences back to *original* frame and tile pixels (pixel-centre aware). The homography `H` therefore maps frame pixels → tile pixels. The RANSAC threshold, reprojection error and frame footprint are in **map pixels**, whatever the method or `WORK_SCALE`.
+- **Common matcher interface** (`src/matching/base.py`): `extract(image) → Features` and `match_features(f0, f1) → MatchResult`, plus `warmup()`.
+  - LightGlue: SuperPoint keypoints + LightGlue.
+  - LoFTR: Kornia, `outdoor` weights, input sizes are multiples of 8.
+  - Tile features can be cached (`tile_cache_key`), and frame features can be reused across tiles (used in Stage 3).
+- **Fair timing.**
+  - Warm-up on images of the experiment size, and `torch.cuda.synchronize()` around every timed block.
+  - Time is split into frame extraction, tile extraction, matching and RANSAC. Images are read from disk before timing.
+  - LoFTR has no separate detection step, so its whole cost is in `time_match`.
+
+### Metrics (`experiments/results/raw/matching_results.csv`)
+
+| Column | Definition |
+|---|---|
+| `matches` | correspondences returned by the method |
+| `inliers` | geometrically consistent correspondences: RANSAC reprojection error ≤ `RANSAC_THRESHOLD` = 3 map px |
+| `inlier_ratio` | `inliers / matches` |
+| `reproj_mean/median/rmse/max` | forward error `‖H·p_frame − p_tile‖` over inliers, in map px (bounded by the RANSAC threshold by construction) |
+| `h_scale`, `h_rotation_deg`, `h_anisotropy` | local similarity parameters of `H` at the frame centre (Jacobian) |
+| `h_plausible` | orientation preserved, footprint convex, no sign change of the projective denominator, anisotropy ≤ 1.5, scale within `[s_f/2, 2·s_f]` |
+| `success` | `H` found **and** `inliers ≥ MIN_INLIERS` (15) **and** `h_plausible`; otherwise `failure_reason` says why |
+| `center_x_map`, `center_y_map` | projection of the frame centre onto the full map (px) |
+| `time_*` | seconds; `time_matcher_total = time_extract_frame + time_extract_tile + time_match` |
+
+Each run also writes `*_info.json` with the full pipeline and matcher configuration, the git commit and the device. Figures go to `experiments/figures/matching/pair_XXX/`:
+
+- `*_matches.png`: all correspondences, inliers in green and the rest in red;
+- `*_inliers.png`: inliers only;
+- `*_footprint.png`: the projected frame outline and centre on the map, with the tile outline.
+
+### Stage 2 findings (frame_0002)
+
+- **The old prototype compared the methods at different resolutions.** `SuperPoint.extract()` rescales its input to 1024 px by default, so LightGlue ran at 1024 × 1024 while LoFTR ran at 512 × 512, and both saw only a centre crop of the frame. The pipeline now disables this implicit resize (`resize=None`).
+- **Scale calibration.** Matching frame_0002 against a 1024 × 1024 map crop that contains the whole frame gives a consistent `h_scale` of 0.267–0.277. This holds for both methods, with RANSAC or MAGSAC and `WORK_SCALE` 1.0 or 1.5, and the frame centre estimates agree within ≈16 map px. Hence `FRAME_TO_MAP_SCALE = 0.27`.
+- **512 px tiles do not contain a whole frame footprint (≈518 × 292 px).** On the reference tile `tile_0196`, RANSAC fits the plane of the tall building roof: LoFTR gives `h_scale` ≈ 0.20, LightGlue ≈ 0.25. The frame centre still lands within ≈15 px of the full-crop estimate, because it lies on that roof. This motivates the tile-size experiment and a larger search window in Stage 3.
+- **Negative control** (frame_0002 against 33 tiles):
+  - Tiles that do not overlap the frame yield at most 15 inliers (LightGlue) and 14 (LoFTR), and all of them are rejected, one of them by the plausibility check.
+  - Every overlapping tile succeeds with 18–240 inliers.
+  - The margin around `MIN_INLIERS = 15` is small; the ranking criterion must be settled in Stage 3.
+
+## Stage 3 prototype
+
+```bash
+python scripts/localize_frame.py --frame frame_0002.png --method LightGlue --max-tiles 20
+```
+
+Exhaustive search over tiles with cached tile features. The candidate order (success, then inliers) is provisional. `src/evaluation/scoring.py` is not used yet and will be replaced by the Stage 3 ranking criterion.
+
+## Tests
 
 ```bash
 python -m pytest tests -q
 # or, without pytest:
 python tests/test_stage1_preprocessing.py
+python tests/test_stage2_pipeline.py
 ```
 
-The tests use synthetic maps and videos. The frame-extraction test embeds the frame index into each frame and checks that the saved frames are exactly the ones recorded in `frames.csv`.
+Stage 1 tests use synthetic maps and videos. The frame-extraction test embeds the frame index into each frame and checks that the saved frames are exactly the ones recorded in `frames.csv`.
 
-## Matching and localization (prototype, revised in Stage 2)
+Stage 2 tests use an oracle matcher that returns correspondences generated from a known homography, plus outliers. They check:
 
-```bash
-python scripts/evaluate.py          # LightGlue vs LoFTR on data/metadata/eval_pairs.csv
-python scripts/summarize.py         # aggregates into experiments/results/summary/
-python scripts/localize_frame.py --frame frame_0002.png --method LightGlue --max-tiles 20
-```
-
-Reported metrics:
-
-- processing time;
-- number of matches;
-- number and share of geometrically consistent matches after RANSAC;
-- mean reprojection error;
-- success rate.
-
-Tile ranking uses a separate, documented technical score (`src/evaluation/scoring.py`) that is not treated as a research metric.
+- the coordinate round trip through resizing, including rounding sizes to multiples of 8;
+- that `H` is recovered in original pixels for several working scales;
+- reproducible RANSAC with a fixed seed;
+- rejection of implausible homographies;
+- frame-centre projection onto the map;
+- tile-feature caching.
 
 ## Known issues
 
-- `scripts/evaluate_golden_pair.py` and `scripts/visualize_golden_pair.py` are out of date with the current matcher/geometry API. They will be replaced in Stage 2.
-- Matchers currently center-crop the frame to a square and resize it to 512 px. With 512 px tiles this leaves a ≈1.9× scale gap between frame and tile and discards ~44 % of the frame width. Scale normalization is planned for Stage 2.
-- The evaluation pairs used before Stage 1 did not show the same place (see `eval_pairs_legacy_256.csv`). The old `tiles.csv` also lacked the ROI offset (912, 1409). Results obtained with them should not be reused.
-- The homography model assumes an approximately planar scene and a near-nadir camera.
+- The homography model assumes an approximately planar scene and a near-nadir camera. With tall buildings, RANSAC can lock onto a roof plane instead of the ground; see the Stage 2 findings.
+- `FRAME_TO_MAP_SCALE` was calibrated on a single frame. If the flight altitude changes, the scale changes as well. The plausibility check tolerates a factor of 2.
+- The evaluation pairs used before Stage 1 did not show the same place (see `eval_pairs_legacy_256.csv`). The old `tiles.csv` also lacked the ROI offset (912, 1409). Results obtained with them should not be reused, and neither should the timing and inlier numbers from the term paper, which came from the unequal resolutions described above.
+- Results are not bit-identical across devices. On frame_0002, LightGlue returned 309 matches on CPU and 310 on GPU, and `h_scale` changed from 0.250 to 0.267. Compare results only within one device, and `*_info.json` records which device was used.
+- Timing on frame_0002 (median of 5 runs, `time_matcher_total`):
+  - GTX 1650: LightGlue 0.25 s, LoFTR 0.27 s;
+  - CPU: 1.85 s and 3.24 s.
 
 ## Roadmap
 
-1. Unified matching pipeline with scale normalization, cached tile features and GPU warm-up for fair timing.
+1. ~~Unified matching pipeline with scale normalization, cached tile features and GPU warm-up for fair timing.~~ Done in Stage 2.
 2. Automatic tile search with a clearly defined ranking criterion and homography sanity checks.
 3. Frame-to-map position estimation and a manually annotated `ground_truth.csv`.
 4. Sequence processing with temporal consistency and neighbour-tile search.

@@ -1,82 +1,68 @@
-import sys
-from pathlib import Path as _Path
+"""Прототип Етапу 3: перебір тайлів для одного кадру (буде переглянуто на Етапі 3).
 
-sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+Використовує єдиний pipeline Етапу 2: ознаки кадру обчислюються один раз,
+ознаки тайлів кешуються. Порядок кандидатів: спочатку успішні зіставлення,
+потім більша кількість геометрично узгоджених відповідностей. Остаточний
+критерій ранжування визначається на Етапі 3.
+
+Приклад:
+    python scripts/localize_frame.py --frame frame_0002.png --method LightGlue --max-tiles 20
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
-from pathlib import Path
+
 import pandas as pd
 
-from src.config import FRAMES_DIR, TILES_DIR, TILES_METADATA_PATH, RESULTS_DIR
-from src.evaluation.scoring import tile_selection_score
-from src.geometry.homography import estimate_homography_metrics
-from src.matching.lightglue import LightGlueMatcher
-from src.matching.loftr import LoFTRMatcher
-from src.localization.estimate import estimate_global_position
+from src.config import FRAMES_DIR, RESULTS_DIR, TILES_DIR, TILES_METADATA_PATH
+from src.matching import MATCHER_NAMES, create_matcher
+from src.matching.pipeline import PairMatchingPipeline, PipelineConfig
+from src.preprocessing.images import read_image_rgb
 
 
-def rank_tiles(method_name, matcher, frame_path, tiles_dir, tile_metadata, max_tiles=None):
+def rank_tiles(pipeline, frame, frame_name, tiles):
+    prepared = pipeline.prepare_frame(frame)
+    frame_features = (prepared, pipeline.matcher.extract(prepared.image))
     rows = []
-    tiles = tile_metadata.copy()
-    if max_tiles is not None:
-        tiles = tiles.head(max_tiles)
     for _, tile in tiles.iterrows():
-        tile_path = tiles_dir / tile["tile_id"]
-        try:
-            result = matcher.match(str(frame_path), str(tile_path))
-            metrics = estimate_homography_metrics(result["pts0"], result["pts1"])
-            score = tile_selection_score(metrics)
-            position = estimate_global_position(
-                result["image0"].shape, metrics["H"], float(tile["x_origin"]), float(tile["y_origin"]),
-                (int(tile["height"]), int(tile["width"])),
-            )
-            rows.append({"method": method_name, "frame": frame_path.name,
-                         "tile": tile["tile_id"], "time": result["time"],
-                         "matches": metrics["matches"], "inliers": metrics["inliers"],
-                         "inlier_ratio": metrics["inlier_ratio"],
-                         "reprojection_error": metrics["reprojection_error"],
-                         "success": metrics["success"], "tile_selection_score": score,
-                         "position_x": None if position is None else position[0],
-                         "position_y": None if position is None else position[1]})
-        except Exception as exc:
-            rows.append({"method": method_name, "frame": frame_path.name,
-                         "tile": tile["tile_id"], "time": None, "matches": 0,
-                         "inliers": 0, "inlier_ratio": 0, "reprojection_error": None,
-                         "success": False, "tile_selection_score": 0,
-                         "position_x": None, "position_y": None, "error": str(exc)})
-    return pd.DataFrame(rows).sort_values(
-        ["success", "tile_selection_score", "inliers", "inlier_ratio"],
-        ascending=[False, False, False, False],
-    )
+        image = read_image_rgb(TILES_DIR / tile["tile_id"])
+        result = pipeline.run(frame, image, (tile["x_origin"], tile["y_origin"]),
+                              tile_cache_key=tile["tile_id"], frame_features=frame_features)
+        rows.append({"method": pipeline.matcher.name, "frame": frame_name,
+                     "tile": tile["tile_id"], **result.to_row()})
+    return pd.DataFrame(rows).sort_values(["success", "inliers", "inlier_ratio"],
+                                          ascending=False)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Find the most plausible map tile for a UAV frame.")
     parser.add_argument("--frame", required=True)
-    parser.add_argument("--method", choices=["LoFTR", "LightGlue", "both"], default="both")
+    parser.add_argument("--method", choices=[*MATCHER_NAMES, "both"], default="both")
     parser.add_argument("--max-tiles", type=int, default=None)
+    parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
     frame_path = Path(args.frame)
     if not frame_path.is_absolute():
         frame_path = FRAMES_DIR / frame_path
-    metadata = pd.read_csv(TILES_METADATA_PATH)
-    matchers = []
-    if args.method in ("LoFTR", "both"):
-        matchers.append(("LoFTR", LoFTRMatcher()))
-    if args.method in ("LightGlue", "both"):
-        matchers.append(("LightGlue", LightGlueMatcher()))
+    frame = read_image_rgb(frame_path)
+    tiles = pd.read_csv(TILES_METADATA_PATH)
+    if args.max_tiles is not None:
+        tiles = tiles.head(args.max_tiles)
 
-    all_results = []
-    for name, matcher in matchers:
-        df = rank_tiles(name, matcher, frame_path, TILES_DIR, metadata, args.max_tiles)
-        all_results.append(df)
-
-    result = pd.concat(all_results, ignore_index=True)
+    methods = MATCHER_NAMES if args.method == "both" else (args.method,)
+    results = [rank_tiles(PairMatchingPipeline(create_matcher(m, args.device), PipelineConfig()),
+                          frame, frame_path.name, tiles) for m in methods]
+    result = pd.concat(results, ignore_index=True)
     out = RESULTS_DIR / "rankings" / f"tile_ranking_{frame_path.stem}.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(out, index=False)
-    print(result.groupby("method").head(5))
+    print(result.groupby("method").head(5)[["method", "tile", "matches", "inliers",
+                                            "inlier_ratio", "success", "center_x_map",
+                                            "center_y_map"]])
     print(f"Saved: {out}")
 
 

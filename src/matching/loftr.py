@@ -1,43 +1,35 @@
-import time
+"""LoFTR (готова реалізація Kornia, detector-free)."""
+from __future__ import annotations
 
-import cv2
+import kornia.feature as KF
 import numpy as np
 import torch
-import kornia.feature as KF
 
-from src.config import IMAGE_SIZE
+from src.config import LOFTR_PRETRAINED
 from src.matching.base import ImageMatcher
-from src.preprocessing.images import prepare_image
+from src.preprocessing.images import image_to_tensor, rgb_to_gray
 
 
 class LoFTRMatcher(ImageMatcher):
-    def __init__(self, device: str | None = None, image_size: tuple[int, int] = IMAGE_SIZE):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.image_size = image_size
-        self.matcher = KF.LoFTR(pretrained="outdoor").to(self.device).eval()
+    name = "LoFTR"
+    # Грубий рівень LoFTR працює на сітці 1/8 роздільності.
+    size_multiple = 8
 
-    def _load_gray_tensor(self, image_path: str, center_crop: bool):
-        image = prepare_image(image_path, self.image_size, grayscale=True, center_crop=center_crop)
-        tensor = torch.from_numpy(image)[None, None].float() / 255.0
-        return tensor.to(self.device), image
+    def __init__(self, device: str | None = None, pretrained: str = LOFTR_PRETRAINED):
+        super().__init__(device)
+        self.pretrained = pretrained
+        self.matcher = KF.LoFTR(pretrained=pretrained).eval().to(self.device)
 
-    def match(self, image0_path: str, image1_path: str):
-        image0_tensor, image0 = self._load_gray_tensor(image0_path, center_crop=True)
-        image1_tensor, image1 = self._load_gray_tensor(image1_path, center_crop=False)
-        batch = {"image0": image0_tensor, "image1": image1_tensor}
+    def config(self) -> dict:
+        return {**super().config(), "pretrained": self.pretrained,
+                "coarse_threshold": self.matcher.config["match_coarse"]["thr"]}
 
-        if self.device == "cuda":
-            torch.cuda.synchronize()
-        start = time.perf_counter()
-        with torch.no_grad():
-            output = self.matcher(batch)
-        if self.device == "cuda":
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
+    def _extract(self, image: np.ndarray):
+        # Окремої детекції немає: «ознаки» — це лише тензор у градаціях сірого.
+        return image_to_tensor(rgb_to_gray(image), self.device), None
 
-        pts0 = output["keypoints0"].detach().cpu().numpy()
-        pts1 = output["keypoints1"].detach().cpu().numpy()
-        confidence = output["confidence"].detach().cpu().numpy()
-
-        return {"pts0": pts0, "pts1": pts1, "confidence": confidence,
-                "time": elapsed, "image0": image0, "image1": image1}
+    @torch.inference_mode()
+    def _match(self, tensor0, tensor1):
+        output = self.matcher({"image0": tensor0, "image1": tensor1})
+        return (output["keypoints0"].cpu().numpy(), output["keypoints1"].cpu().numpy(),
+                output["confidence"].cpu().numpy())

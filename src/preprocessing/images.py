@@ -119,14 +119,6 @@ def write_image_rgb(path: str | Path, image_rgb: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 # Геометричні операції
 # ---------------------------------------------------------------------------
-def center_crop_square(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
-    side = min(h, w)
-    x0 = (w - side) // 2
-    y0 = (h - side) // 2
-    return image[y0:y0 + side, x0:x0 + side]
-
-
 def resize(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     """Масштабування до ``(W, H)``. Для зменшення — INTER_AREA (без аліасингу)."""
     w, h = size_wh
@@ -137,18 +129,45 @@ def resize(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return cv2.resize(image, (w, h), interpolation=interpolation)
 
 
-def prepare_image(path: str | Path, size: tuple[int, int], grayscale: bool = False,
-                  center_crop: bool = False) -> np.ndarray:
-    """Завантаження для matcher: RGB (або grayscale), опційне обрізання, resize.
+def scaled_size(width: int, height: int, scale: float, multiple: int = 1) -> tuple[int, int]:
+    """Розмір ``(W, H)`` після масштабування на ``scale`` з округленням до кратного ``multiple``.
 
-    ``size`` задається як ``(W, H)`` — так само, як у ``cv2.resize``.
+    Кратність потрібна моделям із фіксованим кроком сітки (LoFTR: 8). Через
+    округлення фактичні масштаби по осях можуть трохи відрізнятися від ``scale``,
+    тому для перетворення координат використовуються саме фактичні масштаби.
     """
-    image = read_image_rgb(path)
-    if grayscale:
-        image = rgb_to_gray(image)
-    if center_crop:
-        image = center_crop_square(image)
-    return resize(image, size)
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
+    multiple = max(1, int(multiple))
+    w = max(multiple, int(round(width * scale / multiple)) * multiple)
+    h = max(multiple, int(round(height * scale / multiple)) * multiple)
+    return w, h
+
+
+def resize_by_scale(image: np.ndarray, scale: float,
+                    multiple: int = 1) -> tuple[np.ndarray, tuple[float, float]]:
+    """Масштабує зображення і повертає фактичні масштаби ``(sx, sy) = new / original``."""
+    src_h, src_w = image.shape[:2]
+    w, h = scaled_size(src_w, src_h, scale, multiple)
+    return resize(image, (w, h)), (w / src_w, h / src_h)
+
+
+def to_original_coordinates(points: np.ndarray, scale_xy: tuple[float, float]) -> np.ndarray:
+    """Переносить точки з масштабованого зображення в оригінальне.
+
+    Враховано узгодження центрів пікселів, яке використовує ``cv2.resize``:
+    ``x_src = (x_dst + 0.5) / sx - 0.5``.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    scale = np.asarray(scale_xy, dtype=np.float64).reshape(1, 2)
+    return (points + 0.5) / scale - 0.5
+
+
+def to_scaled_coordinates(points: np.ndarray, scale_xy: tuple[float, float]) -> np.ndarray:
+    """Обернене до :func:`to_original_coordinates`."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    scale = np.asarray(scale_xy, dtype=np.float64).reshape(1, 2)
+    return (points + 0.5) * scale - 0.5
 
 
 # ---------------------------------------------------------------------------

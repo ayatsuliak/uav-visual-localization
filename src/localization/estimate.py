@@ -1,30 +1,31 @@
+"""Перенесення точки кадру в координати повної карти.
+
+Гомографія ``H`` відображає оригінальні пікселі кадру в оригінальні пікселі
+тайла (див. ``src.matching.pipeline``), тому перехід до карти — лише зсув
+на початок тайла: ``x_map = x_tile + x_local``, ``y_map = y_tile + y_local``.
+"""
+from __future__ import annotations
+
 import numpy as np
 
-
-def transform_point(point_xy, H):
-    point = np.asarray(point_xy, dtype=np.float32).reshape(1, 1, 2)
-    transformed = cv2_perspective_transform(point, H)
-    return transformed.reshape(2)
+from src.geometry.homography import project_points
 
 
-def cv2_perspective_transform(point, H):
-    import cv2
-    return cv2.perspectiveTransform(point, H)
+def frame_center(frame_size_wh: tuple[int, int]) -> tuple[float, float]:
+    w, h = frame_size_wh
+    return (w - 1) / 2.0, (h - 1) / 2.0
 
 
-def estimate_global_position(frame_shape, homography, tile_x, tile_y, tile_shape,
-                             matcher_image_size=(512, 512)):
-    """Estimate frame-center position in original map coordinates.
-
-    Homography maps processed frame coordinates to processed tile coordinates.
-    The tile is then converted from matcher resolution to its original map pixels.
-    """
-    if homography is None:
+def frame_point_to_map(point_xy, H: np.ndarray | None,
+                       tile_origin_xy: tuple[float, float]) -> tuple[float, float] | None:
+    """Точка кадру (px кадру) -> точка повної карти (px карти) або ``None``."""
+    if H is None:
         return None
-    h, w = frame_shape[:2]
-    center = np.array([[[w / 2.0, h / 2.0]]], dtype=np.float32)
-    tile_point = cv2_perspective_transform(center, homography).reshape(2)
-    tile_h, tile_w = tile_shape[:2]
-    sx = tile_w / matcher_image_size[0]
-    sy = tile_h / matcher_image_size[1]
-    return np.array([tile_x + tile_point[0] * sx, tile_y + tile_point[1] * sy], dtype=float)
+    x, y = project_points([point_xy], H)[0]
+    return float(tile_origin_xy[0] + x), float(tile_origin_xy[1] + y)
+
+
+def estimate_global_position(frame_size_wh: tuple[int, int], H: np.ndarray | None,
+                             tile_origin_xy: tuple[float, float]) -> tuple[float, float] | None:
+    """Положення БпЛА на карті як проєкція центра кадру (надирна камера)."""
+    return frame_point_to_map(frame_center(frame_size_wh), H, tile_origin_xy)
