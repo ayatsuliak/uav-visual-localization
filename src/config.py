@@ -72,6 +72,17 @@ MIN_INLIERS = 15                # мінімум геометрично узго
 SCALE_TOLERANCE = 2.0           # масштаб H у [s_f / 2, s_f * 2]
 MAX_ANISOTROPY = 1.5            # відношення сингулярних чисел якобіана H у центрі кадру
 
+# --- Етап 3: вибір тайла (src/evaluation/scoring.py) ------------------------
+MIN_INLIER_RATIO = 0.15         # мінімальна частка геометрично узгоджених відповідностей
+MAX_REPROJ_ERROR = 3.5          # px карти, середня похибка репроєкції (запобіжник)
+CENTER_MARGIN = 30.0            # px: допуск для «центр кадру всередині тайла»
+SCORE_SIGMA_R = 2.0             # px: регуляризація похибки в балі ранжування
+TOP_K = 5                       # скільки найкращих кандидатів виводити
+
+# --- Етап 3: кеш ознак тайлів ------------------------------------------------
+SUPERPOINT_CACHE_DIR = PROCESSED_DIR / "cache_superpoint"
+LOCALIZATION_RESULT_PATH = RESULTS_DIR / "localization_single_frame.json"
+
 
 def portable_path(path) -> str:
     """Шлях відносно кореня проєкту (якщо можливо) у POSIX-форматі — для переносних метаданих."""

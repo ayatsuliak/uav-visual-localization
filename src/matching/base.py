@@ -85,6 +85,17 @@ class ImageMatcher(ABC):
         """Параметри методу, що записуються в метадані експерименту."""
         return {"name": self.name, "device": self.device, "size_multiple": self.size_multiple}
 
+    # --- Дисковий кеш ознак (лише для методів з окремим етапом детекції) ---
+    #: Чи можна зберегти результат ``extract`` і повторно використати його.
+    supports_feature_cache: bool = False
+
+    def features_to_arrays(self, feats: Features) -> dict[str, np.ndarray]:
+        raise NotImplementedError(f"{self.name} does not support feature caching")
+
+    def features_from_arrays(self, arrays: dict[str, np.ndarray],
+                             device: str | None = None) -> Features:
+        raise NotImplementedError(f"{self.name} does not support feature caching")
+
     # --- Публічний API ----------------------------------------------------
     def extract(self, image: np.ndarray) -> Features:
         self._check_image(image)

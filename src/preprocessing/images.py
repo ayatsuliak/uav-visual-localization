@@ -152,6 +152,16 @@ def resize_by_scale(image: np.ndarray, scale: float,
     return resize(image, (w, h)), (w / src_w, h / src_h)
 
 
+def rescale_frame(frame: np.ndarray, frame_to_map_scale: float, work_scale: float = 1.0,
+                  multiple: int = 1) -> tuple[np.ndarray, tuple[float, float]]:
+    """Приводить кадр до роздільності карти (× ``work_scale``).
+
+    ``frame_to_map_scale`` — пікселів карти на піксель кадру (≈0.27 для DJI_0331).
+    Повертає зображення і фактичні масштаби ``(sx, sy)``.
+    """
+    return resize_by_scale(frame, frame_to_map_scale * work_scale, multiple)
+
+
 def to_original_coordinates(points: np.ndarray, scale_xy: tuple[float, float]) -> np.ndarray:
     """Переносить точки з масштабованого зображення в оригінальне.
 

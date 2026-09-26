@@ -24,9 +24,9 @@ from src.evaluation.metrics import reprojection_error_stats
 from src.geometry.homography import (HomographyDiagnostics, HomographyResult, PlausibilityConfig,
                                      RansacConfig, diagnose_homography, estimate_homography,
                                      is_successful)
-from src.localization.estimate import estimate_global_position
+from src.localization.coordinates import estimate_global_position
 from src.matching.base import Features, ImageMatcher, MatchResult
-from src.preprocessing.images import resize_by_scale, to_original_coordinates
+from src.preprocessing.images import rescale_frame, resize_by_scale, to_original_coordinates
 
 
 @dataclass(frozen=True)
@@ -50,9 +50,17 @@ class PipelineConfig:
 @dataclass
 class PreparedImage:
     """Зображення в робочій роздільності + фактичні масштаби для перенесення координат."""
-    image: np.ndarray                    # RGB uint8 у робочій роздільності
+    image: np.ndarray | None             # RGB uint8 у робочій роздільності (None — ознаки з кешу)
     scale_xy: tuple[float, float]        # (sx, sy) = робоча / оригінальна роздільність
     original_size: tuple[int, int]       # (W, H) оригіналу
+    work_size: tuple[int, int]           # (W, H) у робочій роздільності
+
+    @classmethod
+    def from_sizes(cls, original_size, work_size) -> "PreparedImage":
+        """Опис зображення без пікселів — для ознак, завантажених із кешу."""
+        (w, h), (ww, wh) = original_size, work_size
+        return cls(image=None, scale_xy=(ww / w, wh / h), original_size=(w, h),
+                   work_size=(ww, wh))
 
 
 @dataclass
@@ -78,8 +86,8 @@ class PairResult:
         errors = reprojection_error_stats(g.inlier_errors())
         center = self.frame_center_map
         return {
-            "frame_work_w": self.frame.image.shape[1], "frame_work_h": self.frame.image.shape[0],
-            "tile_work_w": self.tile.image.shape[1], "tile_work_h": self.tile.image.shape[0],
+            "frame_work_w": self.frame.work_size[0], "frame_work_h": self.frame.work_size[1],
+            "tile_work_w": self.tile.work_size[0], "tile_work_h": self.tile.work_size[1],
             "keypoints_frame": m.num_keypoints0, "keypoints_tile": m.num_keypoints1,
             "matches": g.num_matches, "inliers": g.num_inliers, "inlier_ratio": g.inlier_ratio,
             "reproj_mean": errors["mean"], "reproj_median": errors["median"],
@@ -109,20 +117,33 @@ class PairMatchingPipeline:
     def prepare(self, image: np.ndarray, scale: float) -> PreparedImage:
         h, w = image.shape[:2]
         resized, scale_xy = resize_by_scale(image, scale, self.matcher.size_multiple)
-        return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h))
+        return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h),
+                             work_size=(resized.shape[1], resized.shape[0]))
 
     def prepare_frame(self, frame: np.ndarray) -> PreparedImage:
-        return self.prepare(frame, self.config.frame_scale)
+        """Кадр -> роздільність карти × work_scale (``rescale_frame``)."""
+        h, w = frame.shape[:2]
+        resized, scale_xy = rescale_frame(frame, self.config.frame_to_map_scale,
+                                          self.config.work_scale, self.matcher.size_multiple)
+        return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h),
+                             work_size=(resized.shape[1], resized.shape[0]))
+
+    def frame_features(self, frame: np.ndarray) -> tuple[PreparedImage, Features]:
+        """Ознаки кадру — обчислюються один раз для перебору багатьох тайлів."""
+        prepared = self.prepare_frame(frame)
+        return prepared, self.matcher.extract(prepared.image)
 
     def prepare_tile(self, tile: np.ndarray) -> PreparedImage:
         return self.prepare(tile, self.config.work_scale)
 
-    def tile_features(self, tile: np.ndarray, cache_key=None) -> tuple[PreparedImage, Features]:
+    def tile_features(self, tile: np.ndarray | None, cache_key=None) -> tuple[PreparedImage, Features]:
         """Ознаки тайла; за наявності ``cache_key`` обчислюються один раз.
 
         Час екстракції з кешу дорівнює нулю — так відображається реальна
         вартість обробки, коли ознаки карти підготовлено заздалегідь.
         """
+        if tile is None and cache_key not in self._tile_cache:
+            raise KeyError(f"Tile '{cache_key}' is not cached and no image was given")
         if cache_key is not None and cache_key in self._tile_cache:
             prepared, feats = self._tile_cache[cache_key]
             return prepared, Features(feats.data, feats.image_size, feats.num_keypoints, 0.0)
@@ -131,6 +152,13 @@ class PairMatchingPipeline:
         if cache_key is not None:
             self._tile_cache[cache_key] = (prepared, feats)
         return prepared, feats
+
+    def add_cached_tile(self, cache_key, prepared: PreparedImage, feats: Features) -> None:
+        """Додає готові ознаки тайла (наприклад, з дискового кешу ``src.preprocessing.cache``)."""
+        self._tile_cache[cache_key] = (prepared, feats)
+
+    def is_cached(self, cache_key) -> bool:
+        return cache_key in self._tile_cache
 
     def clear_cache(self) -> None:
         self._tile_cache.clear()
@@ -145,7 +173,7 @@ class PairMatchingPipeline:
         self.matcher.warmup((f[1], f[0]), (t[1], t[0]), iterations)
 
     # --- Основний крок ----------------------------------------------------
-    def run(self, frame: np.ndarray, tile: np.ndarray, tile_origin=(0.0, 0.0),
+    def run(self, frame: np.ndarray | None, tile: np.ndarray | None, tile_origin=(0.0, 0.0),
             tile_cache_key=None, frame_features: tuple[PreparedImage, Features] | None = None
             ) -> PairResult:
         """Зіставляє кадр із тайлом.
@@ -154,8 +182,7 @@ class PairMatchingPipeline:
         перебору кількох тайлів (Stage 3).
         """
         if frame_features is None:
-            prepared_frame = self.prepare_frame(frame)
-            feats_frame = self.matcher.extract(prepared_frame.image)
+            prepared_frame, feats_frame = self.frame_features(frame)
         else:
             prepared_frame, feats_frame = frame_features
         prepared_tile, feats_tile = self.tile_features(tile, tile_cache_key)

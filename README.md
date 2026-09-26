@@ -21,9 +21,9 @@ Out of scope: training new networks, re-implementing LightGlue/LoFTR, full SLAM,
 |---|---|---|
 | 1 | Data preparation: map tiling, frame extraction, metadata, integrity checks | ✅ done |
 | 2 | Unified pipeline `frame + tile → matcher → RANSAC → metrics` | ✅ done |
-| 3 | Automatic best-tile search and ranking | ⏳ next (prototype: `localize_frame.py`) |
-| 4 | Frame position on the full map | 🧪 prototype |
-| 5–6 | Frame sequences, temporal consistency, neighbour-tile search | planned |
+| 3 | Automatic best-tile search and ranking | ✅ done |
+| 4 | Frame position on the full map (centre + footprint) | ✅ done (single frame, Stage 3) |
+| 5–6 | Frame sequences, temporal consistency, neighbour-tile search | ⏳ next |
 | 7–10 | Experiments, ground truth, error statistics, figures | planned |
 
 ## Repository structure
@@ -36,7 +36,8 @@ uav-visual-localization/
 │   │   └── video/         # DJI_0331.mp4                  (local only, not in Git)
 │   ├── processed/
 │   │   ├── frames/        # frame_0001.png, ...           (generated)
-│   │   └── tiles/         # tile_0001.png, ...            (generated)
+│   │   ├── tiles/         # tile_0001.png, ...            (generated)
+│   │   └── cache_superpoint/  # tile_XXXX.npz + manifest.json (generated)
 │   └── metadata/
 │       ├── tiles.csv                  # tile registry (generated, committed)
 │       ├── frames.csv                 # frame registry (generated, committed)
@@ -45,12 +46,13 @@ uav-visual-localization/
 │       └── golden_pair.csv            # reference pair from the term paper
 ├── src/
 │   ├── config.py          # paths and default parameters
-│   ├── preprocessing/     # images.py, tiles.py, frames.py, validation.py
+│   ├── run_info.py        # git commit, device, map size for result metadata
+│   ├── preprocessing/     # images.py, tiles.py, frames.py, validation.py, cache.py
 │   ├── matching/          # base.py (ImageMatcher), lightglue.py, loftr.py, pipeline.py
 │   ├── geometry/          # homography.py (RANSAC, reprojection error, plausibility)
-│   ├── evaluation/        # metrics.py, scoring.py
-│   ├── localization/      # estimate.py (tile → map coordinates)
-│   └── visualization/     # matches.py
+│   ├── evaluation/        # metrics.py, scoring.py (gate + ranking score)
+│   ├── localization/      # coordinates.py (frame → map), search.py (tile search)
+│   └── visualization/     # matches.py, localization.py
 ├── scripts/               # command-line entry points (see below)
 ├── tests/                 # unit tests on synthetic data
 ├── experiments/
@@ -224,13 +226,89 @@ Each run also writes `*_info.json` with the full pipeline and matcher configurat
   - Every overlapping tile succeeds with 18–240 inliers.
   - The margin around `MIN_INLIERS = 15` is small; the ranking criterion must be settled in Stage 3.
 
-## Stage 3 prototype
+## Stage 3: automatic tile search and single-frame localization
 
 ```bash
-python scripts/localize_frame.py --frame frame_0002.png --method LightGlue --max-tiles 20
+python scripts/build_tile_cache.py                 # once: SuperPoint features of all 384 tiles
+python scripts/localize_frame.py --frame data/processed/frames/frame_0002.png --matcher lightglue
+python scripts/localize_frame.py --matcher loftr --roi 256 1536 2048 3072   # search only inside a ROI
+python scripts/localize_frame.py --matcher loftr --grid-step 2              # every 2nd tile row/column
 ```
 
-Exhaustive search over tiles with cached tile features. The candidate order (success, then inliers) is provisional. `src/evaluation/scoring.py` is not used yet and will be replaced by the Stage 3 ranking criterion.
+No information about the correct tile is used:
+
+```
+frame → frame features (once) → for every tile in the pool: matcher → RANSAC → plausibility
+      → gate → ranking score → winner tile → (X_map, Y_map) + footprint on the 6200×4320 map
+```
+
+### Tile feature cache (`src/preprocessing/cache.py`)
+
+- `build_tile_cache.py` stores SuperPoint keypoints, scores and descriptors of every tile as float32 (no loss) in `data/processed/cache_superpoint/tile_XXXX.npz`.
+  - For the current map this is 384 tiles with 523–1609 keypoints each, 347 MiB in total, built in ≈14 s on the GTX 1650.
+- `manifest.json` records what the cache depends on: the matcher configuration, `WORK_SCALE`, and the SHA-256 of `tiles.csv` and of the map. If any of them change, loading fails instead of silently mixing features. Rebuild with `--overwrite`.
+- At search time the whole cache is loaded into VRAM (`--cache-device model`, the default) or RAM (`--cache-device cpu`).
+  - Cached and on-the-fly features give identical results.
+- LoFTR is detector-free, so there is nothing to cache. For LoFTR, use `--roi` and/or `--grid-step` to limit the search space.
+
+### Tile selection (`src/evaluation/scoring.py`)
+
+**Step 1, gate.** A candidate is rejected if any condition fails:
+
+| Condition | Default |
+|---|---|
+| `H` found and plausible (see Stage 2) | — |
+| `N_inliers ≥ MIN_INLIERS` | 15 |
+| `N_inliers / N_all ≥ MIN_INLIER_RATIO` | 0.15 |
+| mean inlier reprojection error `E ≤ MAX_REPROJ_ERROR` | 3.5 map px |
+| projected frame centre inside the tile: `−m ≤ x_local ≤ S−1+m`, the same for `y` | `m = CENTER_MARGIN` = 30 px |
+| projected frame centre inside the map | 6200 × 4320 |
+
+**Step 2, ranking.** Among the candidates that pass the gate:
+
+```
+Score = N_inliers · (N_inliers / N_all) · exp(−E / σ_r),   σ_r = 2 px
+```
+
+The highest score wins; ties go to more inliers. With `RANSAC_THRESHOLD = 3` px, `E` is always ≤ 3 px, so the reprojection-error gate never fires. It is kept as a safeguard in case the RANSAC threshold is raised.
+
+### Global coordinates (`src/localization/coordinates.py`)
+
+`H` maps original frame pixels to original tile pixels. The homogeneous result is always divided by its third component; a point with `w ≈ 0` becomes `NaN` and is rejected. Then:
+
+```
+X_map = X_origin + x_local,   Y_map = Y_origin + y_local
+```
+
+The project uses pixel-centre coordinates, so the frame centre is `((W−1)/2, (H−1)/2)`, and the footprint is the projection of the four corner pixels `(0,0), (W−1,0), (W−1,H−1), (0,H−1)`.
+
+### Outputs
+
+- `experiments/results/localization_single_frame.json` contains:
+  - the frame, matcher and all parameters;
+  - the search space (ROI, grid step, checked tile ids) and whether the cache was used;
+  - timings;
+  - the winner: tile, score, inliers, `H`, centre in local and map coordinates, footprint polygon, and the score ratio to the runner-up;
+  - the top-K candidates with gate reasons.
+- `experiments/results/rankings/<frame>_<matcher>_candidates.csv`: every checked tile with its metrics, gate outcome and score.
+- `experiments/figures/localization/<frame>_global_loc.png` and `_zoom.png`:
+  - checked tiles as pale grid lines, and tiles that passed the gate in orange;
+  - the winner tile in blue;
+  - the camera footprint as a semi-transparent green polygon;
+  - the frame centre as a red marker.
+
+### Stage 3 results (frame_0002, GTX 1650)
+
+| Run | Tiles checked | Passed gate | Winner | Centre (X, Y), map px | Time |
+|---|---|---|---|---|---|
+| LightGlue, whole map, cache | 384 | 5 | `tile_0220` | (1121.4, 2344.7) | 33 s (85 ms/tile) |
+| LoFTR, ROI `256 1536 2048 3072` | 56 | 5 | `tile_0197` | (1108.6, 2327.5) | 18 s (313 ms/tile) |
+| LoFTR, `--grid-step 2` | 96 | 1 | `tile_0197` | (1108.6, 2327.5) | 32 s (324 ms/tile) |
+
+- Both winners are tiles adjacent to `tile_0196` that contain the frame centre.
+- The reference estimate from Stage 2, using a 1024 px crop that holds the whole frame, is ≈(1110, 2330). The LoFTR result is within 3 px of it, and the LightGlue result is within ≈19 px.
+- All five tiles that passed the gate overlap the frame footprint. Every tile far from the true position was rejected.
+- The winning tile covers only part of the frame, because the footprint (≈518 × 292 px) is wider than a 512 px tile. This is the main limitation to address in the tile-size experiment.
 
 ## Tests
 
@@ -239,6 +317,7 @@ python -m pytest tests -q
 # or, without pytest:
 python tests/test_stage1_preprocessing.py
 python tests/test_stage2_pipeline.py
+python tests/test_stage3_localization.py
 ```
 
 Stage 1 tests use synthetic maps and videos. The frame-extraction test embeds the frame index into each frame and checks that the saved frames are exactly the ones recorded in `frames.csv`.
@@ -252,9 +331,19 @@ Stage 2 tests use an oracle matcher that returns correspondences generated from 
 - frame-centre projection onto the map;
 - tile-feature caching.
 
+Stage 3 tests check:
+
+- `coordinates.py`: pixel-centre convention, dehomogenization including points at infinity, the tile → map shift, the footprint of a rotated frame, and map bounds;
+- `scoring.py`: the score formula and its monotonicity, every gate condition and its boundary values, and the ranking order;
+- ROI and grid-step tile selection;
+- search with a synthetic matcher, which finds the true tile and reproduces the known global centre and footprint;
+- the disk cache: a round trip gives the same result, and a cache built with other parameters is refused.
+
 ## Known issues
 
 - The homography model assumes an approximately planar scene and a near-nadir camera. With tall buildings, RANSAC can lock onto a roof plane instead of the ground; see the Stage 2 findings.
+- The frame footprint (≈518 × 292 map px) is wider than a 512 px tile, so the winning tile holds only part of the frame. The tile-size experiment (768/1024) should address this.
+- The single-frame result is saved to one file (`localization_single_frame.json`) and is overwritten by the next run; pass `--output` to keep several.
 - `FRAME_TO_MAP_SCALE` was calibrated on a single frame. If the flight altitude changes, the scale changes as well. The plausibility check tolerates a factor of 2.
 - The evaluation pairs used before Stage 1 did not show the same place (see `eval_pairs_legacy_256.csv`). The old `tiles.csv` also lacked the ROI offset (912, 1409). Results obtained with them should not be reused, and neither should the timing and inlier numbers from the term paper, which came from the unequal resolutions described above.
 - Results are not bit-identical across devices. On frame_0002, LightGlue returned 309 matches on CPU and 310 on GPU, and `h_scale` changed from 0.250 to 0.267. Compare results only within one device, and `*_info.json` records which device was used.
@@ -265,8 +354,8 @@ Stage 2 tests use an oracle matcher that returns correspondences generated from 
 ## Roadmap
 
 1. ~~Unified matching pipeline with scale normalization, cached tile features and GPU warm-up for fair timing.~~ Done in Stage 2.
-2. Automatic tile search with a clearly defined ranking criterion and homography sanity checks.
-3. Frame-to-map position estimation and a manually annotated `ground_truth.csv`.
+2. ~~Automatic tile search with a clearly defined ranking criterion and homography sanity checks.~~ Done in Stage 3.
+3. ~~Frame-to-map position estimation~~ (done in Stage 3) and a manually annotated `ground_truth.csv`.
 4. Sequence processing with temporal consistency and neighbour-tile search.
 5. Experiments:
    - LightGlue vs LoFTR;

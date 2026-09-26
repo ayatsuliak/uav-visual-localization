@@ -21,8 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
 import json
-import platform
-import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from statistics import median
@@ -30,13 +28,14 @@ from statistics import median
 import pandas as pd
 
 from src.config import (DEFAULT_MAP_PATH, EVAL_PAIRS_PATH, FIGURES_DIR, FRAME_TO_MAP_SCALE,
-                        FRAMES_DIR, MATCHING_RESULTS_PATH, MIN_INLIERS, PROJECT_ROOT,
+                        FRAMES_DIR, MATCHING_RESULTS_PATH, MIN_INLIERS,
                         RANSAC_METHOD, RANSAC_THRESHOLD, TILES_DIR, TILES_METADATA_PATH,
                         TIMING_REPEATS, WARMUP_ITERATIONS, WORK_SCALE, portable_path)
 from src.geometry.homography import RansacConfig
 from src.matching import MATCHER_NAMES, create_matcher
 from src.matching.pipeline import PairMatchingPipeline, PipelineConfig
 from src.preprocessing.images import read_image_rgb
+from src.run_info import device_info, git_commit
 from src.visualization.matches import draw_footprint, draw_matches, save_figure
 
 TIME_COLUMNS = ("time_extract_frame", "time_extract_tile", "time_match",
@@ -63,28 +62,6 @@ def parse_args():
     p.add_argument("--figures-dir", default=str(FIGURES_DIR / "matching"))
     p.add_argument("--no-figures", action="store_true")
     return p.parse_args()
-
-
-def git_commit() -> str | None:
-    try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=PROJECT_ROOT,
-                             capture_output=True, text=True, check=True)
-        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT,
-                               capture_output=True, text=True).stdout.strip()
-        return out.stdout.strip() + ("-dirty" if dirty else "")
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
-def device_info(device: str) -> dict:
-    import torch
-    info = {"device": device, "torch": torch.__version__, "cuda": torch.version.cuda,
-            "python": platform.python_version(), "platform": platform.platform()}
-    if device.startswith("cuda"):
-        info["gpu"] = torch.cuda.get_device_name(0)
-    else:
-        info["cpu"] = platform.processor()
-    return info
 
 
 def run_pair(pipeline, frame, tile, tile_origin, repeats):

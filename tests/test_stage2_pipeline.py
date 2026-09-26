@@ -16,7 +16,7 @@ import numpy as np
 from src.evaluation.metrics import reprojection_error_stats
 from src.geometry.homography import (PlausibilityConfig, RansacConfig, diagnose_homography,
                                      estimate_homography, is_successful, project_points)
-from src.localization.estimate import estimate_global_position
+from src.localization.coordinates import estimate_global_position
 from src.matching.base import ImageMatcher
 from src.matching.pipeline import PairMatchingPipeline, PipelineConfig
 from src.preprocessing.images import (resize_by_scale, scaled_size, to_original_coordinates,
