@@ -68,6 +68,14 @@ class Candidate:
     metrics: CandidateMetrics
     evaluation: CandidateEvaluation | None = None
 
+    @property
+    def center_map(self) -> tuple[float, float] | None:
+        """Проєкція центра кадру на повну карту через H цього кандидата."""
+        if self.metrics.center_local is None:
+            return None
+        x, y = local_to_map([self.metrics.center_local], self.tile_origin)[0]
+        return float(x), float(y)
+
     def to_row(self) -> dict:
         center = self.metrics.center_local
         ev = self.evaluation
@@ -141,14 +149,15 @@ class TileSearch:
             tile_id=tile_id, matches=g.num_matches, inliers=g.num_inliers,
             reproj_mean=float(errors.mean()) if len(errors) else None,
             homography_found=g.H is not None, plausible=bool(d is not None and d.plausible),
-            center_local=center_local, tile_size=tile_size, center_in_map=center_in_map)
+            center_local=center_local, tile_size=tile_size, center_in_map=center_in_map,
+            scale=d.scale if d is not None else None,
+            expected_scale=self.pipeline.config.frame_to_map_scale)
 
-    def search(self, frame: np.ndarray, tiles: pd.DataFrame, progress_every: int = 0
-               ) -> SearchResult:
+    def search(self, frame: np.ndarray, tiles: pd.DataFrame, progress_every: int = 0,
+               rotation_deg: float = 0.0) -> SearchResult:
+        """``rotation_deg`` — компенсація курсу кадру (див. ``PairMatchingPipeline.prepare_frame``)."""
         start = time.perf_counter()
-        frame_features = self.pipeline.frame_features(frame)
-        time_frame = frame_features[1].time
-
+        frame_features = self.pipeline.frame_features(frame, rotation_deg)
         candidates, time_io = [], 0.0
         for i, tile in enumerate(tiles.itertuples(index=False), 1):
             # Без дискового кешу ознаки тайла не зберігаються в пам'яті (для LoFTR це
@@ -167,6 +176,30 @@ class TileSearch:
             if progress_every and i % progress_every == 0:
                 print(f"  {i}/{len(tiles)} tiles")
 
+        return self._result(frame_features, candidates, start, time_io)
+
+    def search_regions(self, frame: np.ndarray, regions, rotation_deg: float = 0.0
+                       ) -> SearchResult:
+        """Як ``search``, але для довільних ділянок карти ``(region_id, image, (x0, y0))``.
+
+        Ознаки ділянок не кешуються (вони щоразу інші): вікно навколо прогнозу
+        трекера, уточнення положення після глобального пошуку. Фільтр і бал ті самі,
+        «тайлом» для перевірки «центр кадру всередині» є сама ділянка.
+        """
+        start = time.perf_counter()
+        frame_features = self.pipeline.frame_features(frame, rotation_deg)
+        candidates = []
+        for region_id, image, origin in regions:
+            origin = (float(origin[0]), float(origin[1]))
+            size = (float(image.shape[1]), float(image.shape[0]))
+            pair = self.pipeline.run(None, image, origin, frame_features=frame_features)
+            candidates.append(Candidate(region_id, origin, size, pair,
+                                        self.candidate_metrics(region_id, size, pair)))
+        return self._result(frame_features, candidates, start, 0.0)
+
+    def _result(self, frame_features, candidates: list[Candidate], start: float,
+                time_io: float) -> SearchResult:
+        time_frame = frame_features[1].time
         ranked = rank_candidates([c.metrics for c in candidates], self.gate)
         by_id = {c.tile_id: c for c in candidates}
         ordered = []

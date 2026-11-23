@@ -162,6 +162,57 @@ def rescale_frame(frame: np.ndarray, frame_to_map_scale: float, work_scale: floa
     return resize_by_scale(frame, frame_to_map_scale * work_scale, multiple)
 
 
+def scale_matrix(scale_xy: tuple[float, float]) -> np.ndarray:
+    """3×3 перетворення «оригінал -> масштабоване», узгоджене з :func:`to_scaled_coordinates`."""
+    sx, sy = scale_xy
+    return np.array([[sx, 0.0, 0.5 * sx - 0.5], [0.0, sy, 0.5 * sy - 0.5], [0.0, 0.0, 1.0]])
+
+
+def rotate_expand(image: np.ndarray, angle_deg: float, multiple: int = 1,
+                  border: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Поворот зображення на ``angle_deg`` навколо центра з розширенням полотна.
+
+    Кут задано в системі координат зображення (x праворуч, y донизу): точка
+    ``p`` переходить у ``R(angle) · p``, де ``R = [[cos, -sin], [sin, cos]]``;
+    додатний кут — за годинниковою стрілкою на екрані. Полотно розширюється
+    так, щоб зображення вмістилося повністю, і доповнюється до розміру,
+    кратного ``multiple``.
+
+    Повертає ``(rotated, A, valid_mask)``: ``A`` — 3×3 перетворення
+    «вхід -> повернуте», ``valid_mask`` (bool) — пікселі, що належать
+    вихідному зображенню, звужені на ``border`` px (щоб відкинути точки на межі
+    чорного тла).
+    """
+    h, w = image.shape[:2]
+    a = np.radians(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    rotation = np.array([[c, -s], [s, c]])
+    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], float)
+    center = np.array([(w - 1) / 2.0, (h - 1) / 2.0])
+    rotated_corners = (corners - center) @ rotation.T
+    span = rotated_corners.max(axis=0) - rotated_corners.min(axis=0)
+    multiple = max(1, int(multiple))
+    new_w = int(np.ceil((np.ceil(span[0]) + 1) / multiple) * multiple)
+    new_h = int(np.ceil((np.ceil(span[1]) + 1) / multiple) * multiple)
+    new_center = np.array([(new_w - 1) / 2.0, (new_h - 1) / 2.0])
+    A = np.eye(3)
+    A[:2, :2] = rotation
+    A[:2, 2] = new_center - rotation @ center
+    rotated = cv2.warpAffine(image, A[:2], (new_w, new_h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = cv2.warpAffine(np.full((h, w), 255, np.uint8), A[:2], (new_w, new_h),
+                          flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    if border > 0:
+        mask = cv2.erode(mask, np.ones((2 * border + 1, 2 * border + 1), np.uint8))
+    return rotated, A, mask > 0
+
+
+def apply_affine(points: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Застосовує 3×3 афінне перетворення до точок ``(N, 2)``."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    return points @ T[:2, :2].T + T[:2, 2]
+
+
 def to_original_coordinates(points: np.ndarray, scale_xy: tuple[float, float]) -> np.ndarray:
     """Переносить точки з масштабованого зображення в оригінальне.
 
@@ -193,3 +244,37 @@ def image_to_tensor(image: np.ndarray, device: str | None = None):
     tensor = torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1)
     tensor = tensor.unsqueeze(0).float().div_(255.0)
     return tensor.to(device) if device is not None else tensor
+
+
+# ---------------------------------------------------------------------------
+# Штучні спотворення (експеримент стійкості, Етап 5)
+# ---------------------------------------------------------------------------
+def adjust_brightness(image: np.ndarray, alpha: float) -> np.ndarray:
+    """Яскравість: ``I' = alpha · I`` (alpha < 1 — сутінки/хмарність)."""
+    return np.clip(image.astype(np.float32) * alpha, 0, 255).round().astype(np.uint8)
+
+
+def adjust_contrast(image: np.ndarray, alpha: float) -> np.ndarray:
+    """Контраст відносно середнього по кожному каналу: ``I' = alpha · (I - mean) + mean``."""
+    img = image.astype(np.float32)
+    mean = img.reshape(-1, img.shape[-1] if img.ndim == 3 else 1).mean(axis=0)
+    return np.clip(alpha * (img - mean) + mean, 0, 255).round().astype(np.uint8)
+
+
+def add_gaussian_noise(image: np.ndarray, sigma: float, seed: int = 0) -> np.ndarray:
+    """Адитивний гауссів шум N(0, sigma²) у шкалі 0–255 (фіксоване зерно)."""
+    noise = np.random.default_rng(seed).normal(0.0, sigma, image.shape)
+    return np.clip(image.astype(np.float32) + noise, 0, 255).round().astype(np.uint8)
+
+
+def motion_blur(image: np.ndarray, kernel_size: int, angle_deg: float = 0.0) -> np.ndarray:
+    """Лінійне розмиття руху: ядро ``k × k`` з лінією під кутом ``angle_deg``."""
+    k = int(kernel_size)
+    if k < 2:
+        return image
+    kernel = np.zeros((k, k), np.float32)
+    kernel[k // 2, :] = 1.0
+    rotation = cv2.getRotationMatrix2D(((k - 1) / 2.0, (k - 1) / 2.0), angle_deg, 1.0)
+    kernel = cv2.warpAffine(kernel, rotation, (k, k))
+    kernel /= kernel.sum()
+    return cv2.filter2D(image, -1, kernel, borderType=cv2.BORDER_REFLECT)

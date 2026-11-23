@@ -1,0 +1,42 @@
+% =============================================================================
+% Як підключити розділи 2–3 до документа курсової / магістерської роботи
+% (цей файл не компілюється сам по собі — лише фрагменти для копіювання)
+% =============================================================================
+
+% 1. Завантажте в Overleaf папки sections/ і images/master/ (структура збігається
+%    з курсовою: рисунки в images/...).
+
+% 2. У ПРЕАМБУЛУ (після \usepackage{tikz}) додайте один рядок:
+\usetikzlibrary{arrows.meta,positioning,babel}
+
+% 3. ЗАМІСТЬ старих \section{Програмне забезпечення ...} і
+%    \section{Результати експериментів ...} вставте:
+\input{sections/section2_implementation}
+\input{sections/section3_experiments}
+%    (кожен файл сам починається з \newpage і \section{...}).
+
+% 4. У СПИСОК ДЖЕРЕЛ (у ваше середовище thebibliography, в алфавітному порядку
+%    латинських авторів) додайте нові записи. Ключі lightglue, loftr, superpoint,
+%    ransac вже є у вашому списку і використовуються як є.
+
+\bibitem{magsac}
+Barath D., Noskova J., Ivashechkin M., Matas J. {\it MAGSAC++, a Fast, Reliable and Accurate Robust Estimator} --- \url{https://arxiv.org/pdf/1912.05909}
+
+\bibitem{opencv}
+Bradski G. {\it The OpenCV Library} --- \url{https://opencv.org}
+
+\bibitem{hartley}
+Hartley R., Zisserman A. {\it Multiple View Geometry in Computer Vision}. 2nd ed. Cambridge University Press, 2004.
+
+\bibitem{pytorch}
+Paszke A., Gross S., Massa F. et al. {\it PyTorch: An Imperative Style, High-Performance Deep Learning Library} --- \url{https://arxiv.org/pdf/1912.01703}
+
+\bibitem{kornia}
+Riba E., Mishkin D., Ponsa D., Rublee E., Bradski G. {\it Kornia: an Open Source Differentiable Computer Vision Library for PyTorch} --- \url{https://arxiv.org/pdf/1910.02190}
+
+\bibitem{exg}
+Woebbecke D. M., Meyer G. E., Von Bargen K., Mortensen D. A. {\it Color Indices for Weed Identification Under Various Soil, Residue, and Lighting Conditions}. Transactions of the ASAE, 1995, 38(1), pp. 259--269.
+
+% 5. Зауваження до вашого поточного файлу: у кінці документа
+%    \begin{thebibliography}{7} відкрито двічі (зовнішнє та внутрішнє
+%    середовище). Залиште одне: \begin{thebibliography}{99} ... \end{thebibliography}.

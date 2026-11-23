@@ -19,14 +19,15 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-from src.config import FRAME_TO_MAP_SCALE, MIN_INLIERS, WORK_SCALE
+from src.config import FRAME_TO_MAP_SCALE, MIN_INLIERS, ROTATION_BORDER_PX, WORK_SCALE
 from src.evaluation.metrics import reprojection_error_stats
 from src.geometry.homography import (HomographyDiagnostics, HomographyResult, PlausibilityConfig,
                                      RansacConfig, diagnose_homography, estimate_homography,
                                      is_successful)
 from src.localization.coordinates import estimate_global_position
 from src.matching.base import Features, ImageMatcher, MatchResult
-from src.preprocessing.images import rescale_frame, resize_by_scale, to_original_coordinates
+from src.preprocessing.images import (apply_affine, rescale_frame, resize_by_scale,
+                                      rotate_expand, scale_matrix, to_original_coordinates)
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,27 @@ class PreparedImage:
     scale_xy: tuple[float, float]        # (sx, sy) = робоча / оригінальна роздільність
     original_size: tuple[int, int]       # (W, H) оригіналу
     work_size: tuple[int, int]           # (W, H) у робочій роздільності
+    # Повне перетворення «оригінал -> робоче» (3×3); None — лише масштаб scale_xy.
+    transform: np.ndarray | None = None
+    # Пікселі робочого зображення, що належать кадру (після повороту); None — усі.
+    valid_mask: np.ndarray | None = None
+    rotation_deg: float = 0.0            # поворот, застосований до кадру перед зіставленням
+
+    def to_original(self, points: np.ndarray) -> np.ndarray:
+        """Точки робочого зображення -> оригінальні пікселі."""
+        if self.transform is None:
+            return to_original_coordinates(points, self.scale_xy)
+        return apply_affine(points, np.linalg.inv(self.transform))
+
+    def inside_valid(self, points: np.ndarray) -> np.ndarray:
+        """Маска точок, що лежать у коректній області (не на тлі після повороту)."""
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        if self.valid_mask is None:
+            return np.ones(len(points), dtype=bool)
+        h, w = self.valid_mask.shape
+        x = np.clip(np.rint(points[:, 0]).astype(int), 0, w - 1)
+        y = np.clip(np.rint(points[:, 1]).astype(int), 0, h - 1)
+        return self.valid_mask[y, x]
 
     @classmethod
     def from_sizes(cls, original_size, work_size) -> "PreparedImage":
@@ -120,17 +142,33 @@ class PairMatchingPipeline:
         return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h),
                              work_size=(resized.shape[1], resized.shape[0]))
 
-    def prepare_frame(self, frame: np.ndarray) -> PreparedImage:
-        """Кадр -> роздільність карти × work_scale (``rescale_frame``)."""
-        h, w = frame.shape[:2]
-        resized, scale_xy = rescale_frame(frame, self.config.frame_to_map_scale,
-                                          self.config.work_scale, self.matcher.size_multiple)
-        return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h),
-                             work_size=(resized.shape[1], resized.shape[0]))
+    def prepare_frame(self, frame: np.ndarray, rotation_deg: float = 0.0) -> PreparedImage:
+        """Кадр -> роздільність карти × work_scale (``rescale_frame``).
 
-    def frame_features(self, frame: np.ndarray) -> tuple[PreparedImage, Features]:
+        ``rotation_deg`` — компенсація курсу: кадр повертається на очікуваний кут
+        «кадр -> карта», щоб matcher бачив кадр в орієнтації карти (SuperPoint і
+        LoFTR не інваріантні до великих поворотів). Гомографія все одно
+        оцінюється в оригінальних пікселях кадру.
+        """
+        h, w = frame.shape[:2]
+        multiple = self.matcher.size_multiple
+        resized, scale_xy = rescale_frame(frame, self.config.frame_to_map_scale,
+                                          self.config.work_scale,
+                                          1 if rotation_deg else multiple)
+        if not rotation_deg:
+            return PreparedImage(image=resized, scale_xy=scale_xy, original_size=(w, h),
+                                 work_size=(resized.shape[1], resized.shape[0]))
+        rotated, A, mask = rotate_expand(resized, rotation_deg, multiple,
+                                         border=ROTATION_BORDER_PX)
+        return PreparedImage(image=rotated, scale_xy=scale_xy, original_size=(w, h),
+                             work_size=(rotated.shape[1], rotated.shape[0]),
+                             transform=A @ scale_matrix(scale_xy), valid_mask=mask,
+                             rotation_deg=float(rotation_deg))
+
+    def frame_features(self, frame: np.ndarray, rotation_deg: float = 0.0
+                       ) -> tuple[PreparedImage, Features]:
         """Ознаки кадру — обчислюються один раз для перебору багатьох тайлів."""
-        prepared = self.prepare_frame(frame)
+        prepared = self.prepare_frame(frame, rotation_deg)
         return prepared, self.matcher.extract(prepared.image)
 
     def prepare_tile(self, tile: np.ndarray) -> PreparedImage:
@@ -188,10 +226,11 @@ class PairMatchingPipeline:
         prepared_tile, feats_tile = self.tile_features(tile, tile_cache_key)
 
         work = self.matcher.match_features(feats_frame, feats_tile)
+        keep = prepared_frame.inside_valid(work.pts0)       # не тло після повороту
         match = MatchResult(
-            pts0=to_original_coordinates(work.pts0, prepared_frame.scale_xy),
-            pts1=to_original_coordinates(work.pts1, prepared_tile.scale_xy),
-            confidence=work.confidence, num_keypoints0=work.num_keypoints0,
+            pts0=prepared_frame.to_original(work.pts0[keep]),
+            pts1=prepared_tile.to_original(work.pts1[keep]),
+            confidence=work.confidence[keep], num_keypoints0=work.num_keypoints0,
             num_keypoints1=work.num_keypoints1, time_extract0=work.time_extract0,
             time_extract1=work.time_extract1, time_match=work.time_match, extra=work.extra,
         )
@@ -201,7 +240,14 @@ class PairMatchingPipeline:
                tile_origin=(0.0, 0.0)) -> PairResult:
         """RANSAC + перевірка правдоподібності + критерій успіху."""
         cfg = self.config
-        homography = estimate_homography(match.pts0, match.pts1, cfg.ransac)
+        if match.num_matches < cfg.min_inliers:
+            # Критерій успіху недосяжний: RANSAC не запускається (на наборі з самих
+            # викидів cv2.RANSAC відпрацьовує всі max_iters ітерацій, ≈0.1 с).
+            n = match.num_matches
+            homography = HomographyResult(H=None, inlier_mask=np.zeros(n, dtype=bool),
+                                          num_matches=n, reprojection_errors=np.full(n, np.nan))
+        else:
+            homography = estimate_homography(match.pts0, match.pts1, cfg.ransac)
         diagnostics = None
         if homography.H is not None:
             plaus = cfg.plausibility

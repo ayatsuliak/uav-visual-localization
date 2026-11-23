@@ -64,6 +64,11 @@ $RECYCLE.BIN/
 # Thesis documents (term paper, project brief) — kept locally only
 # =============================================================================
 documents/
+# Defence presentations and speech drafts (binary, edited outside the repo)
+thesis/*.pptx
+thesis/*.docx
+# Ad-hoc screenshots in the repository root
+/img.png
 
 # =============================================================================
 # Model weights / caches (downloaded automatically by LightGlue / Kornia)
@@ -85,6 +90,14 @@ data/raw/maps/*
 !data/raw/maps/.gitkeep
 data/raw/video/*
 !data/raw/video/.gitkeep
+# Flight logs contain precise GNSS positions: kept locally only
+data/raw/coords/*
+
+# Other datasets (UAV_DATASET): dataset.json is versioned, derived data is not
+data/datasets/*/processed/
+data/datasets/*/metadata/*_info.json
+# GNSS reference derived from the flight log (lat/lon of every frame): local only
+data/datasets/*/metadata/ground_truth.csv
 
 data/processed/*
 !data/processed/frames/
@@ -108,6 +121,8 @@ experiments/results/**/*
 !experiments/results/**/
 !experiments/results/**/.gitkeep
 experiments/figures/**/*
+experiments/series/
+experiments/datasets/
 !experiments/figures/**/
 !experiments/figures/**/.gitkeep
 

@@ -204,7 +204,11 @@ def is_successful(result: HomographyResult, diagnostics: HomographyDiagnostics |
     відповідностей ``>= min_inliers`` ∧ гомографія правдоподібна.
     """
     if result.H is None:
-        return False, "no homography" if result.num_matches >= 4 else "fewer than 4 matches"
+        if result.num_matches < 4:
+            return False, "fewer than 4 matches"
+        if result.num_matches < min_inliers:
+            return False, f"matches {result.num_matches} < {min_inliers}"
+        return False, "no homography"
     if result.num_inliers < min_inliers:
         return False, f"inliers {result.num_inliers} < {min_inliers}"
     if diagnostics is not None and not diagnostics.plausible:

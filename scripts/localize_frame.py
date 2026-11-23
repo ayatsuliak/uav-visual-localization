@@ -30,7 +30,8 @@ import numpy as np
 import pandas as pd
 
 from src.config import (DEFAULT_MAP_PATH, FIGURES_DIR, FRAMES_DIR, LOCALIZATION_RESULT_PATH,
-                        RESULTS_DIR, SUPERPOINT_CACHE_DIR, TILES_DIR, TILES_METADATA_PATH, TOP_K,
+                        RESULTS_DIR, SCORE_SIGMA_SCALE, SUPERPOINT_CACHE_DIR, TILES_DIR,
+                        TILES_METADATA_PATH, TOP_K,
                         WARMUP_ITERATIONS, portable_path)
 from src.evaluation.scoring import GateConfig
 from src.localization.search import TileSearch, select_tiles
@@ -45,6 +46,11 @@ from src.visualization.matches import save_figure
 MATCHERS = {name.lower(): name for name in MATCHER_NAMES}
 
 
+def optional_float(value: str) -> float | None:
+    """Число або ``none`` / ``off`` (параметр вимкнено)."""
+    return None if value.strip().lower() in ("none", "off") else float(value)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--frame", default=str(FRAMES_DIR / "frame_0002.png"),
@@ -56,6 +62,8 @@ def parse_args():
                    help="перевіряти кожен n-й стовпець і рядок сітки тайлів")
     p.add_argument("--top_k", "--top-k", dest="top_k", type=int, default=TOP_K)
     p.add_argument("--device", default=None)
+    p.add_argument("--score-sigma-scale", type=optional_float, default=SCORE_SIGMA_SCALE,
+                   help="σ_s штрафу за масштаб у балі; none — вимкнено (типово — з config)")
     p.add_argument("--no-cache", action="store_true", help="не використовувати кеш ознак тайлів")
     p.add_argument("--cache-dir", default=str(SUPERPOINT_CACHE_DIR))
     p.add_argument("--cache-device", choices=["model", "cpu"], default="model",
@@ -102,7 +110,7 @@ def main():
     matcher = create_matcher(method, device=args.device)
     config = PipelineConfig()
     pipeline = PairMatchingPipeline(matcher, config)
-    gate = GateConfig()
+    gate = GateConfig(sigma_scale=args.score_sigma_scale)
 
     cache_used, cache_load_time = False, None
     if matcher.supports_feature_cache and not args.no_cache:

@@ -1,0 +1,24 @@
+{
+  "name": "flight2",
+  "description": "DJI Mavic Mini, 24.11.2025, поля біля траси E471 (Львівщина); відео 960x540, 335 с; карта Esri World Imagery, QGIS, UTM 34N, 0.30 м/пкс",
+  "map": "data/raw/maps/flight_geo.png",
+  "map_world_file": "data/raw/maps/flight_geo.pgw",
+  "map_crs": "EPSG:32634",
+  "video": "data/raw/video/DJI_Mavic_Mini.MP4",
+  "flight_log": "data/raw/coords/24-11-25_FR_F03.csv",
+  "log_time_offset_s": 511.0,
+  "notes": {
+    "flight_log": "Журнал DJI (10 Гц) використовується ЛИШЕ як еталон для оцінки після прогону; система його не читає.",
+    "log_time_offset_s": "t = 0 відео відповідає OSD.flyTime = 511 с; тривалість відео 335 с = 846 - 511.",
+    "FRAME_TO_MAP_SCALE": "Апріорна оцінка без GNSS: висота за барометром ~101 м, горизонтальний кут огляду камери ~73 градуси -> ширина кадру на місцевості ~150 м = ~499 пкс карти -> 499 / 960 = 0.52. Уточнюється калібруванням за гомографією (scripts/calibrate_scale.py).",
+    "TILE_SIZE": "Сторона тайла ~ ширині кадру на карті (~500 пкс), кратна 8; перекриття 33 %.",
+    "COMPASS_OFFSET_DEG": "Кут зближення меридіанів сітки UTM 34N у районі польоту: atan(tan(23.99-21) * sin(49.64)) = 2.28 градуса. Курс із журналу (GIMBAL.yaw) береться як показ компаса; залишкова розбіжність із курсом, оціненим системою з гомографії, ~3 градуси."
+  },
+  "overrides": {
+    "FRAME_TO_MAP_SCALE": 0.52,
+    "TILE_SIZE": 496,
+    "TILE_OVERLAP": 0.33,
+    "MAP_GSD_M": 0.3003,
+    "COMPASS_OFFSET_DEG": 2.28
+  }
+}

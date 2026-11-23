@@ -15,7 +15,8 @@ import numpy as np
 import pandas as pd
 
 from src.evaluation.scoring import (CandidateMetrics, GateConfig, center_inside_tile,
-                                    evaluate_candidate, rank_candidates, ranking_score)
+                                    evaluate_candidate, rank_candidates, ranking_score,
+                                    scale_penalty)
 from src.localization.coordinates import (apply_homography, estimate_global_position,
                                           footprint_on_map, frame_center, frame_corners,
                                           inside_bounds, local_to_map)
@@ -108,6 +109,34 @@ def test_score_monotonicity():
     assert ranking_score(80, 200, 1.0, 2) > ranking_score(80, 200, 2.0, 2)
     # Не зводиться до inliers / error: подвоєння похибки не ділить бал навпіл.
     assert not math.isclose(ranking_score(80, 200, 2.0, 2) / ranking_score(80, 200, 1.0, 2), 0.5)
+
+
+def test_scale_penalty():
+    # Вимкнено або масштаб невідомий -> множник 1, бал не змінюється.
+    assert scale_penalty(0.2, 0.27, None) == 1.0
+    assert scale_penalty(None, 0.27, 0.15) == 1.0
+    assert math.isclose(scale_penalty(0.27, 0.27, 0.15), 1.0)
+    # Симетричний у логарифмічній шкалі: ×0.8 і ×1.25 штрафуються однаково.
+    assert math.isclose(scale_penalty(0.27 * 0.8, 0.27, 0.15),
+                        scale_penalty(0.27 * 1.25, 0.27, 0.15))
+    assert scale_penalty(0.20, 0.27, 0.15) < scale_penalty(0.25, 0.27, 0.15) < 1.0
+    assert scale_penalty(0.0, 0.27, 0.15) == 0.0
+    # Без штрафу GateConfig не змінює бал навіть за відомого масштабу.
+    plain = evaluate_candidate(candidate(), GateConfig(sigma_scale=None))
+    off = evaluate_candidate(candidate(scale=0.2, expected_scale=0.27), GateConfig(sigma_scale=None))
+    assert math.isclose(plain.score, off.score)
+
+
+def test_scale_penalty_changes_winner():
+    # Кадр 2, LightGlue: тайл 0220 (H за дахом, s = 0.207) мав вищий бал за тайл 0196 (s = 0.267).
+    roof = candidate(tile_id="tile_0220", matches=226, inliers=81, reproj_mean=1.582,
+                     scale=0.2069, expected_scale=0.27)
+    ground = candidate(tile_id="tile_0196", matches=310, inliers=89, reproj_mean=1.575,
+                       scale=0.2674, expected_scale=0.27)
+    off = rank_candidates([roof, ground], GateConfig(sigma_scale=None))
+    on = rank_candidates([roof, ground], GateConfig(sigma_scale=0.15))
+    assert off[0][0].tile_id == "tile_0220"
+    assert on[0][0].tile_id == "tile_0196"
 
 
 def test_gate_rejections():
@@ -277,3 +306,18 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {name}")
     print(f"{len(tests)} tests passed")
+
+
+def test_search_regions_arbitrary_window():
+    # Вікно довільного розміру (не тайл, без кешу): та сама геометрія і координати карти.
+    H_true = similarity(0.27, 5, 80, 60)                         # кадр -> вікно (450, 200)
+    with tempfile.TemporaryDirectory() as tmp:
+        search, pipeline = _make_search(_tiles_df(), tmp, H_true)
+        window = np.full((552, 760, 3), TRUE_VALUE, np.uint8)
+        result = search.search_regions(np.zeros((1080, 1920, 3), np.uint8),
+                                       [("window@450,200", window, (450, 200))])
+    assert result.winner is not None and result.winner.tile_id == "window@450,200"
+    assert result.winner.tile_size == (760.0, 552.0)
+    expected = estimate_global_position((1920, 1080), H_true, (450, 200))
+    assert np.allclose(result.center_map(), expected, atol=1e-6)
+    assert not pipeline.is_cached("window@450,200")

@@ -24,6 +24,15 @@
 
     Score = N_inliers · (N_inliers / N_all) · exp(-E_reproj / sigma_r)
 
+Необов'язковий множник (``GateConfig.sigma_scale`` не ``None``) штрафує
+відхилення масштабу гомографії ``s`` від очікуваного ``s_f``:
+
+    Score *= exp(-ln²(s / s_f) / (2 · sigma_s²))
+
+Висота польоту приблизно стала, тому кандидат, чия H має помітно інший масштаб
+(напр., зіставлення за дахом високої будівлі, ближчим до камери), менш імовірно
+описує площину землі. Логарифм робить штраф симетричним для ×0.8 і ×1.25.
+
 Переможець — кандидат із найбільшим ``Score``. За рівності балів перевага
 надається більшій кількості геометрично узгоджених відповідностей.
 """
@@ -33,7 +42,7 @@ import math
 from dataclasses import asdict, dataclass, field
 
 from src.config import (CENTER_MARGIN, MAX_REPROJ_ERROR, MIN_INLIER_RATIO, MIN_INLIERS,
-                        SCORE_SIGMA_R)
+                        SCORE_SIGMA_R, SCORE_SIGMA_SCALE)
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,7 @@ class GateConfig:
     max_reproj_error: float = MAX_REPROJ_ERROR       # px карти
     center_margin: float = CENTER_MARGIN             # px тайла (= px карти)
     sigma_r: float = SCORE_SIGMA_R                   # px карти
+    sigma_scale: float | None = SCORE_SIGMA_SCALE    # None -> без штрафу за масштаб
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -60,6 +70,8 @@ class CandidateMetrics:
     center_local: tuple[float, float] | None          # px тайла
     tile_size: tuple[float, float]                    # (S_w, S_h)
     center_in_map: bool = True
+    scale: float | None = None                        # масштаб H у центрі кадру
+    expected_scale: float | None = None               # s_f (px карти на px кадру)
 
     @property
     def inlier_ratio(self) -> float:
@@ -79,6 +91,16 @@ def ranking_score(inliers: int, matches: int, reproj_error: float, sigma_r: floa
     if matches <= 0 or inliers <= 0:
         return 0.0
     return float(inliers * (inliers / matches) * math.exp(-reproj_error / sigma_r))
+
+
+def scale_penalty(scale: float | None, expected_scale: float | None,
+                  sigma: float | None) -> float:
+    """``exp(-ln²(s / s_f) / (2σ²))``; 1.0, якщо штраф вимкнено або масштаб невідомий."""
+    if sigma is None or scale is None or expected_scale is None:
+        return 1.0
+    if not (scale > 0 and expected_scale > 0 and math.isfinite(scale)):
+        return 0.0
+    return float(math.exp(-math.log(scale / expected_scale) ** 2 / (2.0 * sigma ** 2)))
 
 
 def center_inside_tile(center_local, tile_size, margin: float) -> bool:
@@ -114,9 +136,9 @@ def evaluate_candidate(c: CandidateMetrics, config: GateConfig = GateConfig()) -
     reasons = gate_reasons(c, config)
     if reasons:
         return CandidateEvaluation(c.tile_id, passed=False, score=0.0, reasons=reasons)
-    return CandidateEvaluation(c.tile_id, passed=True,
-                               score=ranking_score(c.inliers, c.matches, c.reproj_mean,
-                                                   config.sigma_r))
+    score = ranking_score(c.inliers, c.matches, c.reproj_mean, config.sigma_r)
+    score *= scale_penalty(c.scale, c.expected_scale, config.sigma_scale)
+    return CandidateEvaluation(c.tile_id, passed=True, score=score)
 
 
 def rank_candidates(candidates: list[CandidateMetrics], config: GateConfig = GateConfig()

@@ -23,8 +23,8 @@ Out of scope: training new networks, re-implementing LightGlue/LoFTR, full SLAM,
 | 2 | Unified pipeline `frame + tile → matcher → RANSAC → metrics` | ✅ done |
 | 3 | Automatic best-tile search and ranking | ✅ done |
 | 4 | Frame position on the full map (centre + footprint) | ✅ done (single frame, Stage 3) |
-| 5–6 | Frame sequences, temporal consistency, neighbour-tile search | ⏳ next |
-| 7–10 | Experiments, ground truth, error statistics, figures | planned |
+| 5–6 | Frame sequences, temporal consistency, neighbour-tile search (Stage 4) | ✅ done |
+| 7–10 | Experiments, ground truth, error statistics, figures (Stage 5) | 🧪 experiments done; ground truth to annotate |
 
 ## Repository structure
 
@@ -43,20 +43,22 @@ uav-visual-localization/
 │       ├── frames.csv                 # frame registry (generated, committed)
 │       ├── eval_pairs.csv             # verified frame–tile pairs (manual)
 │       ├── eval_pairs_legacy_256.csv  # old pairs, marked INVALID (kept for traceability)
-│       └── golden_pair.csv            # reference pair from the term paper
+│       ├── golden_pair.csv            # reference pair from the term paper
+│       ├── ground_truth.csv           # reference frame centres (manual, Stage 5)
+│       └── ground_truth_points.json   # manual frame↔map correspondences
 ├── src/
 │   ├── config.py          # paths and default parameters
 │   ├── run_info.py        # git commit, device, map size for result metadata
 │   ├── preprocessing/     # images.py, tiles.py, frames.py, validation.py, cache.py
 │   ├── matching/          # base.py (ImageMatcher), lightglue.py, loftr.py, pipeline.py
 │   ├── geometry/          # homography.py (RANSAC, reprojection error, plausibility)
-│   ├── evaluation/        # metrics.py, scoring.py (gate + ranking score)
-│   ├── localization/      # coordinates.py (frame → map), search.py (tile search)
-│   └── visualization/     # matches.py, localization.py
+│   ├── evaluation/        # metrics.py, scoring.py, ground_truth.py, terrain.py
+│   ├── localization/      # coordinates.py (frame → map), search.py (tile search), tracker.py
+│   └── visualization/     # matches.py, localization.py, trajectory.py
 ├── scripts/               # command-line entry points (see below)
 ├── tests/                 # unit tests on synthetic data
 ├── experiments/
-│   ├── results/{raw,summary,rankings}/
+│   ├── results/{raw,summary,rankings,tracking,experiments}/
 │   └── figures/{matching,localization,analysis}/
 ├── requirements.txt
 └── README.md
@@ -272,6 +274,8 @@ Score = N_inliers · (N_inliers / N_all) · exp(−E / σ_r),   σ_r = 2 px
 
 The highest score wins; ties go to more inliers. With `RANSAC_THRESHOLD = 3` px, `E` is always ≤ 3 px, so the reprojection-error gate never fires. It is kept as a safeguard in case the RANSAC threshold is raised.
 
+**Optional scale prior.** With `SCORE_SIGMA_SCALE = σ_s` (in `src/config.py`, or `--score-sigma-scale` for `localize_frame.py` / `track_sequence.py`), the score is multiplied by `exp(−ln²(s / s_f) / (2σ_s²))`, where `s` is the scale of `H` at the frame centre and `s_f = FRAME_TO_MAP_SCALE`. It favours candidates whose `H` describes the ground plane over those fitted to a tall roof (e.g. frame 2: tile 0220 with `s = 0.207` loses to tile 0196 with `s = 0.267` at `σ_s = 0.15`). The default is `None` (off), which is how the Stage 5 results were produced.
+
 ### Global coordinates (`src/localization/coordinates.py`)
 
 `H` maps original frame pixels to original tile pixels. The homogeneous result is always divided by its third component; a point with `w ≈ 0` becomes `NaN` and is rejected. Then:
@@ -310,6 +314,185 @@ The project uses pixel-centre coordinates, so the frame centre is `((W−1)/2, (
 - All five tiles that passed the gate overlap the frame footprint. Every tile far from the true position was rejected.
 - The winning tile covers only part of the frame, because the footprint (≈518 × 292 px) is wider than a 512 px tile. This is the main limitation to address in the tile-size experiment.
 
+## Stage 4: frame sequence, temporal consistency and trajectory
+
+```bash
+python scripts/build_tile_cache.py                 # once, for LightGlue
+python scripts/track_sequence.py --limit 20        # first 20 frames
+python scripts/track_sequence.py                   # all frames from frames.csv
+python scripts/track_sequence.py --ransac-method USAC_MAGSAC        # faster local step
+python scripts/track_sequence.py --no-yaw-compensation              # baseline without heading
+python scripts/track_sequence.py --matcher loftr --limit 15 --stride_search 2
+```
+
+### Tracker (`src/localization/tracker.py`)
+
+| State | What happens |
+|---|---|
+| `LOST` (start, or after losing the target) | global search, as in Stage 3, over the whole map, a `--roi` or the `--stride_search` grid. If the winner scores at least `INIT_MIN_SCORE` = 5, the frame is `INITIALIZED` and the state becomes `TRACKING`. |
+| `TRACKING` | search only in the (2r+1)×(2r+1) = **3×3 tile window** (`NEIGHBORHOOD_RADIUS` = 1, at most 9 tiles). After `MAX_MISSES` = 3 frames in a row without an accepted position, the state goes back to `LOST`. |
+
+- **Window centre.** The window is centred on the tile whose centre is nearest to the *predicted* position (constant-velocity extrapolation), not on the previous winner. The previous winner may lie up to 30 px outside its own tile (the centre margin), so a window around it could be off-centre.
+- **Kinematic gate.** `‖P_k − P_last‖ ≤ D_max = V_max·Δt + D_margin`, with `V_max` = 120 map px/s and `D_margin` = 30 px, which gives 150 px at 1 FPS.
+  - The comparison is made against the last **accepted** position, with Δt measured from it, so the allowed radius grows while frames are being extrapolated.
+  - Among the candidates that pass the Stage 3 gate, the best-scoring one that also passes the kinematic gate is chosen.
+  - If no candidate passes, the frame is `INTERPOLATED` at `P̂_k = P_last + v·(t_k − t_last)`, where `v` comes from the last two accepted positions and is capped at `V_max`. At constant Δt this equals `P_{k−1} + (P_{k−1} − P_{k−2})`. The rejected estimate is stored in `x_raw, y_raw` with `event = OUTLIER_REJECTED`.
+- **Heading (yaw) compensation.** SuperPoint/LightGlue and LoFTR are not invariant to large rotations, and the UAV turns during the flight. The frame-to-map angle is known from `H` of the accepted frames (`h_rotation_deg`).
+  - Before matching, the frame is rotated to the predicted heading. The heading is extrapolated with the angular rate, capped at 45°/s. The canvas is expanded, and matches on the black border are masked out.
+  - `H` is still estimated in original frame pixels.
+  - If nothing is found in `TRACKING`, the heading offsets ±45° and ±90° are tried.
+  - In `LOST`, each successive global search uses the next offset from (0°, 90°, 180°, −90°), so a global search costs no more than before.
+- **RANSAC.** It is skipped when `matches < MIN_INLIERS`, because the success criterion is then unreachable. `cv2.RANSAC` on pure outliers runs all 5000 iterations, which takes ≈0.1 s.
+- **Predicted window (`PREDICTED_WINDOW`, `--predicted-window`; off by default).** In `TRACKING` the frame is first matched against one map crop instead of the 3×3 tiles.
+  - The crop is the bounding box of the last accepted footprint, shifted to the predicted position, plus `WINDOW_MARGIN_PX` (128 px). Its sides are multiples of 8 (LoFTR) and it is clipped to the map; above `WINDOW_MAX_SIDE_PX` (1024) the tiles are used.
+  - The frame falls into the crop completely, and one match replaces up to 9. Crop features are extracted on the fly (no cache).
+  - The same Stage 3 gate and kinematic gate apply. If nothing is accepted, the usual 3×3 search with all heading hypotheses follows. Accepted frames have `search_mode = window`.
+- **Refinement after a global search (`REFINE_AFTER_GLOBAL`, `--refine-global`; off by default).** The global winner is matched again against a crop around its footprint (`REFINE_MARGIN_PX` = 64 px). The refined fix is kept only if it passes the gate, has at least as many inliers and moves the centre by ≤ `REFINE_MAX_SHIFT_PX` (30 px). Such frames have `refined = True`.
+- **Trajectory smoothing (`src/localization/smoothing.py`).** A constant-velocity Kalman filter is applied to a finished `trajectory.csv`, so it does not change the tracker's decisions.
+  - Measurements are `TRACKING` / `INITIALIZED` positions with `σ_z = KALMAN_MEAS_STD_PX` (4 px); `INTERPOLATED` frames use the filter prediction, `LOST` frames stay without a position, and every `INITIALIZED` restarts the filter.
+  - Process noise is white acceleration `σ_a = KALMAN_ACCEL_STD_PX_S2` (20 px/s²: a 90° turn at ≈44 px/s over ≈3 s). Both values are set a priori, not tuned on the ground truth.
+  - Two outputs: `x_kf, y_kf` (causal filter, usable online) and `x_rts, y_rts` (Rauch–Tung–Striebel smoother, offline only).
+  - `summarize_results.py` writes `smoothing_table.{csv,md}`: errors on the reliable keyframes for raw / Kalman / RTS, and on how many keyframes each one is better than raw.
+
+### Outputs (`--output_dir`, default `experiments/results/tracking/`)
+
+- `trajectory.csv` has one row per frame, with no gaps.
+  - Main columns: `frame_id, timestamp, status (INITIALIZED | TRACKING | INTERPOLATED | LOST), tile_id, x_map, y_map, inliers, inlier_ratio, reproj_error, process_time`.
+  - Diagnostics: `event (OK | OUTLIER_REJECTED | NO_MATCH | LOW_SCORE), search_mode, tiles_checked, tiles_passed, score, jump_px, max_jump_px, x_raw, y_raw, h_rotation_deg, h_scale, yaw_used, attempts, search_time, refined`. `search_mode` is `global`, `local` (3×3 tiles) or `window`.
+- `trajectory_info.json` records all parameters, summary statistics and the footprints of accepted frames.
+- `experiments/figures/localization/trajectory_plot.png` shows the flight zone, or the whole map with `--full-map`:
+  - the trajectory line with direction arrows;
+  - green = TRACKING, blue = INITIALIZED, yellow = INTERPOLATED, red crosses = rejected outliers;
+  - the footprint of every 10th frame.
+
+### Stage 4 results (all 95 frames of DJI_0331, LightGlue + cache, GTX 1650)
+
+| | Heading compensation (default) | Baseline `--no-yaw-compensation` |
+|---|---|---|
+| INITIALIZED / TRACKING / INTERPOLATED / LOST | 1 / 94 / 0 / 0 | 1 / 17 / 3 / 74 |
+| Target lost | never | at the first turn (frame 19) and never recovered |
+| Mean time, global / local frame | 32.9 s / 1.07 s (median 1.04, P90 1.40) | 31.7 s / 1.17 s |
+| Total run time | 133 s | ≈41 min |
+
+- The flight is a loop around a block of about 1000 × 1200 map px: north, then east, south and west. The four turns change the heading 0° → 90° → 175° → −90° → −40°.
+- Every turn was tracked using the predicted heading alone. The retry offsets were needed for only one frame (frame 72, two attempts).
+- The path length is 4151 map px, and the step is 44 px per frame on average (max 95 px), below `D_max` = 150 px. The last frame ends 375 px from the first one.
+- `h_scale` ranges from 0.20 to 0.32 (median 0.269), which is consistent with the calibrated `FRAME_TO_MAP_SCALE` = 0.27.
+- The local step takes 1.07 s on average: LightGlue on 9 pairs ≈ 0.78 s, and RANSAC ≈ 0.25 s, most of it on tiles without a counterpart.
+  - With `--ransac-method USAC_MAGSAC`, the step takes 0.82 s, and positions differ from RANSAC by 1.7 px on average (max 5.1 px; 16 frames checked). The default stays `RANSAC`, so that Stage 2–4 results remain comparable.
+- Frames 81–84 over trees have only 16–33 inliers, and the trajectory wiggles there by ≈20–30 px. The next stage should add smoothing and ground truth to quantify this.
+
+## Stage 5: ground truth, error metrics and experiments
+
+```bash
+python scripts/annotate_ground_truth.py            # manual annotation of keyframes (GUI)
+python scripts/annotate_ground_truth.py --check    # check figures in experiments/figures/analysis/gt_check/
+python scripts/run_experiments.py all              # experiments 1–4 (~40 min on GTX 1650)
+# system variants (improvements after Stage 5), baseline = Stage 5 system:
+python scripts/run_experiments.py tracking --variants baseline scale_prior window refine all --dry-run
+python scripts/summarize_results.py                # tables + figures
+```
+
+### Ground truth (`src/evaluation/ground_truth.py`, `scripts/annotate_ground_truth.py`)
+
+The reference must not depend on the system being evaluated. It is therefore **not** taken from the tracker output. It is built from **manual** correspondences:
+
+1. For each keyframe, click ≥ 4 pairs of points "frame ↔ map". Use ground-level points (road markings, curb corners, bases of poles), spread over the frame; roofs shift because of parallax.
+2. A least-squares homography is fitted to all pairs (no RANSAC; a bad point shows up in `residual_px`).
+3. The frame centre `((W−1)/2, (H−1)/2)` is projected through this homography.
+
+**Annotation quality.** With 4 pairs the homography fits exactly, so the residual is always 0 and checks nothing. A keyframe is `reliable` only if it has ≥ 5 pairs, no single pair disagrees by more than 3 map px, and the centre is stable under click noise: the 95th percentile of the centre shift under random click errors (σ = 2 px on the frame, 1 px on the map) must be ≤ 5 map px. Clustered points, or a centre far outside them, make this value large. The criterion does not use the system's output. `key_*` metrics use only reliable keyframes, and `annotate_ground_truth.py --recompute` lists the frames to fix. The tool shows these checks live and does not save a frame with fewer than 5 pairs. A separate warning, which does not affect `reliable`, appears when the frame centre lies outside the convex hull of the clicked points. In that case the centre is extrapolated, and systematic errors (lens distortion, parallax) are not covered by the click-noise estimate. `benchmark_table.md` omits the `all_*` columns (interpolated reference); they remain in the CSV.
+
+The tool shows the frame and the map side by side. Once 4 pairs are entered it also shows the projected frame outline, the centre and the residual of each pair. The tracker trajectory is used only to centre the map view initially.
+
+The keyframes are listed in `GT_KEYFRAMES` (16 frames: 1, 6, 12, 19, 25, 31, 44, 51, 60, 64, 72, 76, 80, 82, 90, 94). They were picked visually from `experiments/figures/analysis/frames_contact_sheet.png`:
+
+- each keyframe shows clear ground-level landmarks: roads, markings, parking lots, junctions;
+- together they cover the whole flight evenly, including the turns (19, 51, 72, 94) and the stretch near trees (82, where a parking lot is visible);
+- frames 33–40 (waste ground) and 66–69 (canal, trees) are skipped because they have no reliable points, so their reference is interpolated only.
+
+Note for the thesis: keyframes were selected for how easy they are to annotate, not for how well the system matches them. Even so, urban frames are over-represented, and error over featureless terrain is estimated less precisely.
+
+Outputs:
+
+- `data/metadata/ground_truth_points.json` stores the clicked correspondences, so results can be recomputed (`--recompute`);
+- `data/metadata/ground_truth.csv` has the columns `frame_id, timestamp, x_true, y_true, is_keyframe, n_points, residual_px, source`.
+  - Frames between keyframes get linearly interpolated positions with `is_keyframe = False`.
+  - The **main metrics use keyframes only**, because interpolation is inaccurate across turns.
+
+### Localization metrics (`src/evaluation/metrics.py`)
+
+The error is `e_i = ‖P_pred,i − P_gt,i‖₂` in map px, computed over the frames that have a reference. Frames without an estimate (`LOST`) are left out of mean, median, RMSE, P90, P95 and max. They are counted as failures in:
+
+- `coverage = N_pred / N`;
+- `success@K = |{e_i ≤ K}| / N` for K = 10, 25, 50 px.
+
+### Experiments (`scripts/run_experiments.py`) and results
+
+Setup: all 95 frames of DJI_0331 at 1 FPS, GTX 1650, heading compensation enabled.
+
+**Experiments 1–2: LightGlue vs LoFTR, RANSAC vs USAC_MAGSAC** (`experiments/results/summary/benchmark_table.md`)
+
+| Method | TRACKING / INIT / INTERP / LOST | Global search, s | Local step, s (mean / P90) | Median inliers | Mean inlier ratio | Mean reprojection error, px |
+|---|---|---|---|---|---|---|
+| LightGlue + RANSAC | 94 / 1 / 0 / 0 | 38.3 | 1.08 / 1.40 | 81 | 0.48 | 1.65 |
+| LightGlue + MAGSAC++ | 93 / 1 / 1 / 0 | 20.1 | **0.78** / 1.02 | 87 | 0.50 | 1.73 |
+| LoFTR + RANSAC | 94 / 1 / 0 / 0 | 127.9 | 2.72 / 2.93 | 316 | 0.59 | 1.27 |
+| LoFTR + MAGSAC++ | 94 / 1 / 0 / 0 | 87.5 | 2.27 / 2.49 | 353 | 0.61 | 1.33 |
+
+Positions differ between runs by a median of 0.8–1.7 px and a P90 of 2.3–10.2 px (`trajectory_deviation.md`). The largest differences, 19–43 px, are at frames 79–83 over trees.
+
+- **Method.** Both methods track the whole flight.
+  - LoFTR yields ≈4× more geometrically consistent correspondences and a lower reprojection error, but its local step is ≈2.5× slower.
+  - Which method is more accurate cannot be claimed without the ground truth.
+- **MAGSAC++ vs RANSAC.** MAGSAC++ speeds up the local step by 28% for LightGlue and 17% for LoFTR, and the global search by 1.5–1.9×.
+  - The gain comes from tiles with no counterpart: there, `cv2.RANSAC` runs all 5000 iterations.
+  - With MAGSAC++, LightGlue positions differ from RANSAC by a median of 1.2 px.
+  - With LightGlue + MAGSAC++, one frame was interpolated.
+  - Only LightGlue + MAGSAC++ meets the ≤ 1.0 s target: mean 0.78 s, P90 1.02 s.
+
+**Experiment 3: robustness to distortions** (19 frames, 3×3 window, `robustness_table.md`, `robustness.png`)
+
+The distortions are applied to the original 1920×1080 frame. `retention` is the median of `N_inliers / N_inliers(clean)` for the same frame, and `shift` is the centre displacement relative to the undistorted frame.
+
+| Distortion | LightGlue: localized / retention | LoFTR: localized / retention |
+|---|---|---|
+| brightness ×0.7 / ×0.5 | 100% / 1.00; 100% / 1.01 | 100% / 0.97; 100% / 0.97 |
+| contrast ×0.7 / ×0.5 | 100% / 1.02; 100% / 0.99 | 100% / 1.00; 100% / 0.97 |
+| noise σ = 10 / 25 | 95% / 0.99; 95% / 0.92 | 100% / 1.02; 95% / 0.95 |
+| motion blur 5 / 9 px | 100% / 1.02; 100% / 1.02 | 100% / 1.02; 100% / 1.04 |
+| rotation 15° / 30° | 95% / 1.03; 95% / 0.99 | 95% / 0.82; 95% / 0.52 |
+| rotation 45° / 90° | **53% / 0.35; 0%** | **11% / 0; 0%** |
+| scale error ×0.8 / ×1.25 | 100% / 0.68; 95% / 1.29 | 100% / 0.71; 100% / 1.05 |
+
+- Brightness, contrast, noise and blur at these levels have almost no effect. The median centre shift is ≤ 1.5 px.
+- The critical factor is **rotation**:
+  - LightGlue holds up to 30°, and LoFTR degrades from 15° onwards;
+  - at 45° both methods mostly fail, and at 90° they fail completely.
+  - This quantitatively justifies the heading compensation added in Stage 4.
+- Blur is applied at the original resolution. After the ×0.27 downscale, a 9 px kernel shrinks to ≈2.4 px.
+
+**Experiment 4: problem areas** (`terrain_table.md`, `inliers_vs_terrain.png`)
+
+The terrain features are measured on the map under the frame footprint: the vegetation fraction (Excess Green index) and the texture (mean Sobel gradient).
+
+- Frames 81–84: LightGlue finds a median of **27** inliers against 81 over the whole flight (LoFTR: 138–160 against 316–353).
+  - All methods disagree most with each other there.
+- The vegetation fraction by itself **does not explain** the drop.
+  - For LightGlue, the Spearman correlation between inliers and vegetation is +0.37, because allotment gardens with houses count as "green" yet are rich in detail.
+  - For LoFTR the correlation is −0.29 to −0.33.
+- Texture is the better predictor for LightGlue (ρ = 0.65); for LoFTR ρ = 0.29.
+- A plausible cause of the drop at 81–84 is tree canopy that changes with the season (winter video, summer map). Confirming this requires visual analysis of the frames.
+
+### Status of the Stage 5 acceptance criteria
+
+- ✅ Metrics module, ground-truth tool, experiments 1–4, tables and figures.
+- ⏳ **`ground_truth.csv` still has to be annotated by hand** (16 keyframes, ≈15–20 min):
+  1. run `annotate_ground_truth.py`;
+  2. then run `summarize_results.py`.
+
+  This fills in `key_*` / `all_*` (mean, median, RMSE, P90, max, success@10/25/50) in `benchmark_table`. It also replaces the inter-run deviation plot in `error_over_time.png` with the error-to-reference plot, and adds the reference to `trajectories_vs_gt.png`.
+
 ## Tests
 
 ```bash
@@ -318,6 +501,8 @@ python -m pytest tests -q
 python tests/test_stage1_preprocessing.py
 python tests/test_stage2_pipeline.py
 python tests/test_stage3_localization.py
+python tests/test_stage4_tracking.py
+python tests/test_stage5_evaluation.py
 ```
 
 Stage 1 tests use synthetic maps and videos. The frame-extraction test embeds the frame index into each frame and checks that the saved frames are exactly the ones recorded in `frames.csv`.
@@ -339,10 +524,26 @@ Stage 3 tests check:
 - search with a synthetic matcher, which finds the true tile and reproduces the known global centre and footprint;
 - the disk cache: a round trip gives the same result, and a cache built with other parameters is refused.
 
+Stage 4 tests check:
+
+- the 3×3 neighbourhood inside the grid, at corners and edges, the irregular last column, radius 2, and the nearest tile;
+- `D_max`, the kinematic gate at its boundary, and position extrapolation with the speed cap;
+- tracker states with a scripted search: initialization and the local 3×3 search, outlier rejection with extrapolation, choosing the second candidate when the best one is an outlier, `LOST` after 3 misses followed by global re-initialization, the minimum initialization score, and one CSV row per frame;
+- heading: angle wrapping, heading extrapolation across ±180°, following a turn, retry offsets, the global heading cycle, and disabling compensation;
+- the pipeline with a rotated frame: `H` in original pixels is unchanged, the work image is aligned with the map, and matches on the black border are filtered out.
+
+Stage 5 tests check:
+
+- the reference from manual points: exact points, click noise, too few or mismatched points, the JSON round trip, and interpolation only between keyframes;
+- `trajectory_errors` and `error_statistics`: missing estimates, coverage, RMSE, and success@K counted over all frames with the threshold inclusive;
+- the distortions (brightness, contrast, reproducible noise, blur direction) and the terrain features.
+
 ## Known issues
 
 - The homography model assumes an approximately planar scene and a near-nadir camera. With tall buildings, RANSAC can lock onto a roof plane instead of the ground; see the Stage 2 findings.
 - The frame footprint (≈518 × 292 map px) is wider than a 512 px tile, so the winning tile holds only part of the frame. The tile-size experiment (768/1024) should address this.
+- Heading compensation assumes that the heading changes by less than ≈45° between frames at 1 FPS, beyond what the angular-rate prediction covers; larger jumps rely on the retry offsets (±45°, ±90°).
+- The first global search runs at a heading of 0°. If the video starts with the camera rotated relative to the map, initialization takes up to 4 frames (heading cycle).
 - The single-frame result is saved to one file (`localization_single_frame.json`) and is overwritten by the next run; pass `--output` to keep several.
 - `FRAME_TO_MAP_SCALE` was calibrated on a single frame. If the flight altitude changes, the scale changes as well. The plausibility check tolerates a factor of 2.
 - The evaluation pairs used before Stage 1 did not show the same place (see `eval_pairs_legacy_256.csv`). The old `tiles.csv` also lacked the ROI offset (912, 1409). Results obtained with them should not be reused, and neither should the timing and inlier numbers from the term paper, which came from the unequal resolutions described above.
@@ -356,8 +557,8 @@ Stage 3 tests check:
 1. ~~Unified matching pipeline with scale normalization, cached tile features and GPU warm-up for fair timing.~~ Done in Stage 2.
 2. ~~Automatic tile search with a clearly defined ranking criterion and homography sanity checks.~~ Done in Stage 3.
 3. ~~Frame-to-map position estimation~~ (done in Stage 3) and a manually annotated `ground_truth.csv`.
-4. Sequence processing with temporal consistency and neighbour-tile search.
-5. Experiments:
+4. ~~Sequence processing with temporal consistency and neighbour-tile search.~~ Done in Stage 4 (plus heading compensation).
+5. Experiments (Stage 5; the robustness set also includes scale error and rotation):
    - LightGlue vs LoFTR;
    - tile size 256/512/768/1024;
    - overlap;
